@@ -143,13 +143,13 @@ func (c *searchCriterion) quickMatch(
 
 		return ctDomainOrClientCaseNonStrict(c.value, c.asciiVal, clientID, name, host, ip)
 	case ctFilteringStatus:
-		reason, isFiltered, ok := quickResult(line)
+		reason, isFiltered, quick := quickResult(line)
 
-		return !ok || c.ctFilteringStatusCase(reason, isFiltered)
+		return !quick || c.ctFilteringStatusCase(reason, isFiltered)
 	case ctReason:
-		reason, _, ok := quickResult(line)
+		reason, _, quick := quickResult(line)
 
-		return !ok || slices.Contains(c.values, reason.String())
+		return !quick || slices.Contains(c.values, reason.String())
 	default:
 		return true
 	}

@@ -153,6 +153,9 @@ func populateTestData(tb testing.TB, s *StatsCtx) {
 	err = finishTxn(tx, true)
 	require.NoError(tb, err)
 
+	// Update the cache, as the flushing does.
+	s.cache.set(uint32(oldUnitID), oldUnit)
+
 	s.Update(&Entry{
 		Client:         netutil.IPv4Localhost().String(),
 		Domain:         TestDomain2,

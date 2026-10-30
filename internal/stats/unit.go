@@ -7,9 +7,9 @@ import (
 	"fmt"
 	"maps"
 	"slices"
+	"strings"
 	"time"
 
-	"github.com/AdguardTeam/AdGuardHome/internal/aghnet"
 	"github.com/AdguardTeam/dnsproxy/proxy"
 	"github.com/AdguardTeam/golibs/errors"
 	"github.com/AdguardTeam/golibs/logutil/slogutil"
@@ -233,13 +233,25 @@ func (a countPair) compareCount(b countPair) (res int) {
 	}
 }
 
+// compare is used to sort countPair by Count in descending order and then by
+// Name, so that the pairs with the same count are always in the same order.
+func (a countPair) compare(b countPair) (res int) {
+	if res = a.compareCount(b); res != 0 {
+		return res
+	}
+
+	return strings.Compare(a.Name, b.Name)
+}
+
+// convertMapToSlice returns up to maxVal pairs from m with the highest counts,
+// sorted with [countPair.compare].
 func convertMapToSlice(m map[string]uint64, maxVal int) (s []countPair) {
 	s = make([]countPair, 0, len(m))
 	for k, v := range m {
 		s = append(s, countPair{Name: k, Count: v})
 	}
 
-	slices.SortFunc(s, countPair.compareCount)
+	slices.SortFunc(s, countPair.compare)
 
 	return s[:min(maxVal, len(s))]
 }
@@ -371,31 +383,11 @@ func convertTopSlice(a []countPair) (m []map[string]uint64) {
 	return m
 }
 
-// pairsGetter is a signature for topsCollector argument.
-type pairsGetter func(u *unitDB) (pairs []countPair)
-
-// topsCollector collects statistics about highest values from the given *unitDB
-// slice using pg to retrieve data.
-func topsCollector(units []*unitDB, max int, ignored *aghnet.IgnoreEngine, pg pairsGetter) []map[string]uint64 {
-	m := map[string]uint64{}
-	for _, u := range units {
-		for _, cp := range pg(u) {
-			if !ignored.Has(cp.Name) {
-				m[cp.Name] += cp.Count
-			}
-		}
-	}
-	a2 := convertMapToSlice(m, max)
-
-	return convertTopSlice(a2)
-}
-
 // getData returns the statistics data using the following algorithm:
 //
-//  1. Prepare a slice of N units, where N is the value of "limit" configuration
-//     setting.  Load data for the most recent units from the file.  If a unit
-//     with required ID doesn't exist, just add an empty unit.  Get data for the
-//     current unit.
+//  1. Take the most recent limit units, the last of which is the current unit,
+//     from the cache, loading the ones that aren't cached yet from the
+//     database.  A unit that isn't in the database is empty.
 //
 //  2. Process data from the units and prepare an output map object, including
 //     per time unit counters (DNS queries per time-unit, blocked queries per
@@ -404,8 +396,8 @@ func topsCollector(units []*unitDB, max int, ignored *aghnet.IgnoreEngine, pg pa
 //     data into days.
 //
 //     To get the top counters (queries per domain, queries per blocked domain,
-//     etc.), first sum up data for all units into a single map.  Then,  get the
-//     pairs with the highest numbers.
+//     etc.), sum up data for all units, using the running totals of the cache
+//     for the configured period.  Then, get the pairs with the highest numbers.
 //
 //     The total counters (DNS queries, blocked, etc.) are just the sum of data
 //     for all units.
@@ -427,26 +419,135 @@ func (s *StatsCtx) getData(limit uint32) (resp *StatsResp, ok bool) {
 		}, true
 	}
 
-	units, curID := s.loadUnits(limit)
-	if units == nil {
+	resp, ok = s.dataFromCache(limit)
+	if !ok {
 		return &StatsResp{}, false
 	}
 
-	return s.dataFromUnits(units, curID), true
+	return resp, true
 }
 
-// dataFromUnits collects and returns the statistics data.
-func (s *StatsCtx) dataFromUnits(units []*unitDB, curID uint32) (resp *StatsResp) {
-	topUpstreamsResponses, topUpstreamsAvgTime := topUpstreamsPairs(units)
+// dataFromCache collects and returns the statistics data for the last limit
+// units using s.cache.
+func (s *StatsCtx) dataFromCache(limit uint32) (resp *StatsResp, ok bool) {
+	ok = s.withCache(limit, func(firstID, curID uint32, cur *unitDB) {
+		counters, tops := s.cache.data(
+			firstID,
+			curID,
+			cur,
+			s.ignored.Has,
+			func(name string) (skip bool) { return name != "" && !s.shouldCountClient([]string{name}) },
+		)
 
-	resp = &StatsResp{
-		TopQueried:            topsCollector(units, maxDomains, s.ignored, func(u *unitDB) (pairs []countPair) { return u.Domains }),
-		TopBlocked:            topsCollector(units, maxDomains, s.ignored, func(u *unitDB) (pairs []countPair) { return u.BlockedDomains }),
-		TopUpstreamsResponses: topUpstreamsResponses,
-		TopUpstreamsAvgTime:   topUpstreamsAvgTime,
-		TopClients:            topsCollector(units, maxClients, nil, topClientPairs(s)),
+		resp = &StatsResp{
+			TopQueried: convertTopSlice(tops.domains),
+			TopBlocked: convertTopSlice(tops.blockedDomains),
+			TopClients: convertTopSlice(tops.clients),
+		}
+		resp.TopUpstreamsResponses, resp.TopUpstreamsAvgTime = topUpstreams(
+			tops.upstreamsResponses,
+			tops.upstreamsTimeSum,
+		)
+
+		s.fillCounters(resp, counters, curID)
+	})
+
+	return resp, ok
+}
+
+// withCache caches the last limit units and calls f with the range of their
+// IDs, which ends with the ID of the current unit, and the current unit.  f is
+// called with currMu locked for reading.  It returns false if the units can't
+// be loaded.
+func (s *StatsCtx) withCache(limit uint32, f func(firstID, curID uint32, cur *unitDB)) (ok bool) {
+	db := s.db.Load()
+	if db == nil {
+		return false
 	}
 
+	// Don't lock currMu while reading the database, since that would block
+	// [StatsCtx.Update].
+	if !s.loadCache(db, limit) {
+		return false
+	}
+
+	s.currMu.RLock()
+	defer s.currMu.RUnlock()
+
+	cur := &unitDB{NResult: make([]uint64, resultLast)}
+	curID := s.unitIDGen()
+	if s.curr != nil {
+		cur, curID = s.curr.serialize(), s.curr.id
+	}
+
+	// The units stored while currMu was unlocked are cached by the flushing.
+	f(curID-limit+1, curID, cur)
+
+	return true
+}
+
+// loadCache reads the last limit units that aren't cached from db and caches
+// them.  It returns false if it can't.
+func (s *StatsCtx) loadCache(db *bbolt.DB, limit uint32) (ok bool) {
+	// The cache only changes once an hour, so there should be no more than one
+	// retry.
+	const maxAttempts = 3
+
+	for i := 0; ; i++ {
+		curID := s.currentUnitID()
+		ids, gen := s.cache.missing(curID-limit+1, curID)
+		if len(ids) == 0 {
+			return true
+		} else if i == maxAttempts {
+			s.logger.Error("loading units: cache keeps changing")
+
+			return false
+		}
+
+		udbs, err := s.readUnits(db, ids)
+		if err != nil {
+			s.logger.Error("loading units", slogutil.KeyError, err)
+
+			return false
+		}
+
+		s.cache.add(gen, ids, udbs)
+	}
+}
+
+// currentUnitID returns the ID of the current unit.
+func (s *StatsCtx) currentUnitID() (id uint32) {
+	s.currMu.RLock()
+	defer s.currMu.RUnlock()
+
+	if s.curr != nil {
+		return s.curr.id
+	}
+
+	return s.unitIDGen()
+}
+
+// readUnits returns the units with ids from db.  The units that aren't in db
+// are nil.
+func (s *StatsCtx) readUnits(db *bbolt.DB, ids []uint32) (udbs []*unitDB, err error) {
+	tx, err := db.Begin(false)
+	if err != nil {
+		return nil, fmt.Errorf("opening transaction: %w", err)
+	}
+
+	defer func() { err = errors.WithDeferred(err, finishTxn(tx, false)) }()
+
+	udbs = make([]*unitDB, len(ids))
+	for i, id := range ids {
+		udbs[i] = s.loadUnitFromDB(tx, id)
+	}
+
+	return udbs, nil
+}
+
+// fillCounters fills the time series and the total counters of resp from units,
+// the last of which has the ID curID.  Only the counters of the units are used.
+func (s *StatsCtx) fillCounters(resp *StatsResp, units []*unitDB, curID uint32) {
 	s.fillCollectedStats(resp, units, curID)
 
 	// Total counters:
@@ -475,8 +576,6 @@ func (s *StatsCtx) dataFromUnits(units []*unitDB, curID uint32) (resp *StatsResp
 	if timeN != 0 {
 		resp.AvgProcessingTime = microsecondsToSeconds(float64(sum.TimeAvg / timeN))
 	}
-
-	return resp
 }
 
 // fillCollectedStats fills data with collected statistics.
@@ -548,38 +647,13 @@ func countHours(curHour uint32, days int) (n int) {
 	return hoursInRestDays + hoursInCurDay
 }
 
-func topClientPairs(s *StatsCtx) (pg pairsGetter) {
-	return func(u *unitDB) (clients []countPair) {
-		for _, c := range u.Clients {
-			if c.Name != "" && !s.shouldCountClient([]string{c.Name}) {
-				continue
-			}
-
-			clients = append(clients, c)
-		}
-
-		return clients
-	}
-}
-
-// topUpstreamsPairs returns sorted lists of number of total responses and the
-// average of processing time for each upstream.
-func topUpstreamsPairs(
-	units []*unitDB,
+// topUpstreams returns sorted lists of number of total responses and the
+// average of processing time for each upstream from the summed numbers of
+// responses and processing times.
+func topUpstreams(
+	upstreamsResponses topAddrs,
+	upstreamsTimeSum topAddrsFloat,
 ) (topUpstreamsResponses []topAddrs, topUpstreamsAvgTime []topAddrsFloat) {
-	upstreamsResponses := topAddrs{}
-	upstreamsTimeSum := topAddrsFloat{}
-
-	for _, u := range units {
-		for _, cp := range u.UpstreamsResponses {
-			upstreamsResponses[cp.Name] += cp.Count
-		}
-
-		for _, cp := range u.UpstreamsTimeSum {
-			upstreamsTimeSum[cp.Name] += float64(cp.Count)
-		}
-	}
-
 	upstreamsAvgTime := topAddrsFloat{}
 
 	for u, n := range upstreamsResponses {
