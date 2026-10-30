@@ -40,6 +40,10 @@ NOTE: Add new changes BELOW THIS COMMENT.
 
 - Filtering the query log by status or reason no longer decodes the records that can't match.
 
+- The dashboard statistics are now computed from an in-memory cache of the stored hours with running totals, instead of reading and decoding every hour from the database on every page load.  With 90 days of statistics, the dashboard loads in a few milliseconds instead of most of a second, and loading it no longer delays DNS responses.  The cache is filled in the background at startup and takes up to about 20 MB for 90 days.
+
+- Domains and clients with the same number of requests are now always shown in the same order in the dashboard statistics.
+
 - The new web interface now starts searching the query log 150 ms after typing instead of 500 ms, and ignores the late results of earlier searches.
 
 - The default value of `filtering.blocked_response_ttl` is now 1 second instead of 10, so that clients don't keep using a cached blocked response long after the domain has been unblocked.  Existing configurations are not changed.

@@ -119,6 +119,10 @@ type StatsCtx struct {
 	// curr is the actual statistics collection result.
 	curr *unit
 
+	// cache keeps the stored units decoded, so that the statistics don't have
+	// to be read from the database on every request.  It must not be nil.
+	cache *unitCache
+
 	// db is the opened statistics database, if any.
 	db atomic.Pointer[bbolt.DB]
 
@@ -169,6 +173,7 @@ func New(conf Config) (s *StatsCtx, err error) {
 	s = &StatsCtx{
 		logger:         conf.Logger,
 		currMu:         &sync.RWMutex{},
+		cache:          newUnitCache(),
 		httpReg:        conf.HTTPReg,
 		configModifier: conf.ConfigModifier,
 		filename:       conf.Filename,
@@ -242,6 +247,25 @@ func (s *StatsCtx) Start() {
 	s.initWeb()
 
 	go s.periodicFlush()
+	go s.warmCache()
+}
+
+// warmCache caches the units of the configured period, so that the first
+// request of the statistics is fast as well.
+func (s *StatsCtx) warmCache() {
+	s.confMu.RLock()
+	limit := uint32(s.limit.Hours())
+	enabled := s.enabled
+	s.confMu.RUnlock()
+
+	db := s.db.Load()
+	if !enabled || limit == 0 || db == nil {
+		return
+	}
+
+	start := time.Now()
+	ok := s.loadCache(db, limit)
+	s.logger.Debug("warmed cache", "ok", ok, "elapsed", time.Since(start))
 }
 
 // Close implements the [io.Closer] interface for *StatsCtx.
@@ -278,8 +302,8 @@ func (s *StatsCtx) Close() (err error) {
 // Update implements the [Interface] interface for *StatsCtx.  e must not be
 // nil.
 func (s *StatsCtx) Update(e *Entry) {
-	s.confMu.Lock()
-	defer s.confMu.Unlock()
+	s.confMu.RLock()
+	defer s.confMu.RUnlock()
 
 	if !s.enabled || s.limit == 0 {
 		return
@@ -325,17 +349,13 @@ func (s *StatsCtx) TopClientsIP(maxCount uint) (ips []netip.Addr) {
 		return nil
 	}
 
-	units, _ := s.loadUnits(limit)
-	if units == nil {
-		return nil
-	}
-
 	// Collect data for all the clients to sort and crop it afterwards.
-	m := map[string]uint64{}
-	for _, u := range units {
-		for _, it := range u.Clients {
-			m[it.Name] += it.Count
-		}
+	var m map[string]uint64
+	ok := s.withCache(limit, func(firstID, curID uint32, cur *unitDB) {
+		m = s.cache.clients(firstID, curID, cur)
+	})
+	if !ok {
+		return nil
 	}
 
 	a := convertMapToSlice(m, int(maxCount))
@@ -459,15 +479,22 @@ func (s *StatsCtx) flushDB(id, limit uint32, ptr *unit) (cont bool, sleepFor tim
 
 		return true, 0
 	}
+
+	udb := ptr.serialize()
 	defer func() {
 		if err = finishTxn(tx, isCommitable); err != nil {
 			s.logger.Error("finishing transaction", slogutil.KeyError, err)
+
+			// The state of the database is unknown.
+			s.cache.reset()
+		} else if isCommitable {
+			s.cache.set(ptr.id, udb)
+			s.cache.removeOutside(id-limit+1, id)
 		}
 	}()
 
 	s.curr = newUnit(id)
 
-	udb := ptr.serialize()
 	flushErr := s.flushUnitToDB(udb, tx, ptr.id)
 	if flushErr != nil {
 		s.logger.Error("flushing unit", slogutil.KeyError, flushErr)
@@ -566,65 +593,12 @@ func (s *StatsCtx) clear() (err error) {
 	s.currMu.Lock()
 	defer s.currMu.Unlock()
 
+	// Reset the cache with currMu locked, so that a flush to the old database
+	// can't add its unit after the reset.
+	s.cache.reset()
 	s.curr = newUnit(s.unitIDGen())
 
 	return nil
-}
-
-// loadUnits returns stored units from the database and current unit ID.
-func (s *StatsCtx) loadUnits(limit uint32) (units []*unitDB, curID uint32) {
-	db := s.db.Load()
-	if db == nil {
-		return nil, 0
-	}
-
-	// NOTE:  This mutex, when combined with the database transaction, is
-	// required to be locked first.
-	s.currMu.RLock()
-	defer s.currMu.RUnlock()
-
-	// Use writable transaction to ensure any ongoing writable transaction is
-	// taken into account.
-	tx, err := db.Begin(true)
-	if err != nil {
-		s.logger.Error("opening transaction", slogutil.KeyError, err)
-
-		return nil, 0
-	}
-	cur := s.curr
-
-	if cur != nil {
-		curID = cur.id
-	} else {
-		curID = s.unitIDGen()
-	}
-
-	// Per-hour units.
-	units = make([]*unitDB, 0, limit)
-	firstID := curID - limit + 1
-	for i := firstID; i != curID; i++ {
-		u := s.loadUnitFromDB(tx, i)
-		if u == nil {
-			u = &unitDB{NResult: make([]uint64, resultLast)}
-		}
-		units = append(units, u)
-	}
-
-	err = finishTxn(tx, false)
-	if err != nil {
-		s.logger.Error("finishing transaction", slogutil.KeyError, err)
-	}
-
-	if cur != nil {
-		units = append(units, cur.serialize())
-	}
-
-	if unitsLen := len(units); unitsLen != int(limit) {
-		// Should not happen.
-		panic(fmt.Errorf("loaded %d units when the desired number is %d", unitsLen, limit))
-	}
-
-	return units, curID
 }
 
 // ShouldCount returns true if request for the host should be counted.

@@ -157,10 +157,33 @@ Checks: `TestSearchIndex_differential` compares searches with and without the in
 
 ## Phase 4: dashboard
 
-- Keep running totals for the configured period: add each new hour and subtract the hour that expires.  A page load then sorts the top 100 and merges in the live current hour.
-- Stop decoding every hourly record on every load.
-- Fix the exclusive lock that `StatsCtx.Update` takes on every query.
-- Top lists become more accurate: today each hour keeps only its own top 100.
+The hourly records stay in the database as they are, and an in-memory cache (`internal/stats/cache.go`) keeps them decoded:
+
+- Each cached hour stores its top lists as pairs of a count and a name ID, with the names interned and reference-counted, so a name used in many hours is stored once.
+- The cache keeps running totals per name: an hour is added when it's stored and subtracted when it expires.  A page load for the configured period adds the live current hour to the totals, picks the top 100 of each list, and subtracts the current hour again.  Shorter periods, such as the new web interface's `recent` parameter, sum the cached hours instead, which is still fast.
+- The top 100 is picked by inserting into a sorted list of 100 instead of sorting all names, and the ignored domains and clients are only checked for the names that would make it into the list.
+- The cache is filled in the background at startup.  Reading hours from the database no longer holds the lock that `StatsCtx.Update` needs on every DNS query, so a page load no longer stalls DNS responses.  A generation counter makes sure that hours read while a flush changes the database aren't cached.
+- `StatsCtx.Update` now takes the configuration lock for reading only.  The lock of the current hour is still exclusive, since every query changes its maps.
+- `StatsCtx.TopClientsIP`, which picks the clients to resolve at startup, uses the cache too.
+- Names with the same count are now ordered by name, both in the stored hours and in the top lists, instead of randomly.
+
+Not done: more accurate top lists.  Each stored hour still keeps only its own top 100, and changing that requires a new storage format.
+
+### Phase 4 results
+
+Same machine as the baseline, 90 days (2,160 hours) with 100 entries in every list of every hour and 60,000 distinct names.
+
+| Dashboard | Before | After |
+|---|---|---|
+| Real server over HTTP, median | 745 ms | 4.1 ms |
+| Real server over HTTP, first load after start | 707 ms | 4.5 ms |
+| Longest DNS response while loading the dashboard | 155 ms | 11 ms, at 256 loads per second |
+| Benchmark (`BenchmarkStatsCtx_getData`) | 172 ms, 102 MB allocated | 1.0 ms, 0.6 MB allocated |
+| Server memory (RSS) after 20 loads | 124 MB | 90 MB |
+
+The cache takes about 20 MB in this worst case and grows with the period and the number of entries per hour; for the default period of one day it's negligible.
+
+Checks: `TestStatsCtx_dataFromCache` compares the cache with the original code, which reads every hour from the database (kept in `reference_internal_test.go`), over random updates, flushes, skipped hours, clears, and periods shorter and longer than the configured one, and checks that the running totals and the reference counts match the cached hours and that every cached hour matches the database.  `TestStatsCtx_dataFromCache_concurrent` does the same after concurrent page loads, and `TestUnitCache_add` covers hours read while a flush changes the database.
 
 ## Phase 5: per-query cleanup
 

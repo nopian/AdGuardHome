@@ -608,9 +608,9 @@ func (idx *searchIndex) newSearch(
 
 		s.files[i], err = os.Open(paths[i])
 		if err != nil {
-			s.close()
+			err = fmt.Errorf("opening %q: %w", paths[i], err)
 
-			return nil, fmt.Errorf("opening %q: %w", paths[i], err)
+			return nil, errors.WithDeferred(err, s.close())
 		}
 	}
 
