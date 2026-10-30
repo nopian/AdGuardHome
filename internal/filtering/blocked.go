@@ -24,18 +24,38 @@ var serviceRules map[string][]*rules.NetworkRule
 // serviceIDs contains service IDs sorted alphabetically.
 var serviceIDs []string
 
+// serviceRuleRef is a reference to a rule in serviceRules.
+type serviceRuleRef struct {
+	// id is the ID of the service.
+	id string
+
+	// idx is the index of the rule in the rules of the service.
+	idx int
+}
+
+// serviceDomainRules maps a domain to the plain domain rules of the services
+// for it, see [parseDomainRule].
+var serviceDomainRules map[string][]serviceRuleRef
+
+// serviceOtherRules maps a service ID to the ascending indexes of its rules that
+// aren't plain domain rules.
+var serviceOtherRules map[string][]int
+
 // initBlockedServices initializes package-level blocked service data.  l must
 // not be nil.
 func initBlockedServices(ctx context.Context, l *slog.Logger) {
 	svcLen := len(blockedServices)
 	serviceIDs = make([]string, svcLen)
 	serviceRules = make(map[string][]*rules.NetworkRule, svcLen)
+	serviceDomainRules = map[string][]serviceRuleRef{}
+	serviceOtherRules = map[string][]int{}
 
 	for i, s := range blockedServices {
 		netRules := make([]*rules.NetworkRule, 0, len(s.Rules))
 		for _, text := range s.Rules {
 			rule, err := rules.NewNetworkRule(text, rulelist.IDBlockedService)
 			if err == nil {
+				indexServiceRule(s.ID, text, len(netRules))
 				netRules = append(netRules, rule)
 
 				continue
@@ -57,6 +77,79 @@ func initBlockedServices(ctx context.Context, l *slog.Logger) {
 	slices.Sort(serviceIDs)
 
 	l.DebugContext(ctx, "initialized services", "svc_len", svcLen)
+}
+
+// indexServiceRule adds the rule with text, which has index idx among the rules
+// of the service with id, to serviceDomainRules or serviceOtherRules.
+func indexServiceRule(id, text string, idx int) {
+	domain, _, ok := parseDomainRule([]byte(text))
+	if !ok {
+		serviceOtherRules[id] = append(serviceOtherRules[id], idx)
+
+		return
+	}
+
+	d := string(domain)
+	serviceDomainRules[d] = append(serviceDomainRules[d], serviceRuleRef{
+		id:  id,
+		idx: idx,
+	})
+}
+
+// firstMatchingServiceRule returns the first rule of s matching host, or nil if
+// there is none.  domainRules are the plain domain rules of the services that
+// match host.  req returns the request for host.
+func firstMatchingServiceRule(
+	s ServiceEntry,
+	domainRules []serviceRuleRef,
+	req func() (r *rules.Request),
+) (rule *rules.NetworkRule) {
+	if !hasServiceRules(s) {
+		// The rules of s aren't those of a known service, so check all of them.
+		idx := slices.IndexFunc(s.Rules, func(r *rules.NetworkRule) (ok bool) { return r.Match(req()) })
+		if idx == -1 {
+			return nil
+		}
+
+		return s.Rules[idx]
+	}
+
+	first := -1
+	for _, ref := range domainRules {
+		if ref.id == s.Name && (first == -1 || ref.idx < first) {
+			first = ref.idx
+		}
+	}
+
+	first = firstMatchingOtherRule(s, first, req)
+	if first == -1 {
+		return nil
+	}
+
+	return s.Rules[first]
+}
+
+// hasServiceRules returns true if the rules of s are those of the service with
+// the same ID in serviceRules.
+func hasServiceRules(s ServiceEntry) (ok bool) {
+	svcRules := serviceRules[s.Name]
+
+	return len(s.Rules) > 0 && len(s.Rules) == len(svcRules) && &s.Rules[0] == &svcRules[0]
+}
+
+// firstMatchingOtherRule returns the index of the first rule of s that isn't a
+// plain domain rule and matches the request, if it goes before the rule with
+// index first, which is -1 if there is none.  Otherwise, it returns first.
+func firstMatchingOtherRule(s ServiceEntry, first int, req func() (r *rules.Request)) (idx int) {
+	for _, idx = range serviceOtherRules[s.Name] {
+		if first != -1 && idx > first {
+			break
+		} else if s.Rules[idx].Match(req()) {
+			return idx
+		}
+	}
+
+	return first
 }
 
 // BlockedServices is the configuration of blocked services.

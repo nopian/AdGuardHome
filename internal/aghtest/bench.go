@@ -59,31 +59,29 @@ func BenchBlocklists(tb testing.TB, n, maxDomains int) (paths, domains []string)
 	require.NoError(tb, err)
 	require.NotEmpty(tb, paths, envBenchLists)
 
+	// Take the domains from all lists evenly.
+	perList := max(maxDomains/len(paths), 1)
 	for _, p := range paths {
-		domains = append(domains, readBlockedDomains(tb, p, maxDomains-len(domains))...)
+		domains = append(domains, readBlockedDomains(tb, p, perList)...)
 	}
 
 	return paths, domains
 }
 
 // readBlockedDomains returns up to n domains blocked by the "||domain^" rules
-// from the blocklist at path.
+// and hosts-file lines from the blocklist at path.
 func readBlockedDomains(tb testing.TB, path string, n int) (domains []string) {
 	tb.Helper()
 
+	// #nosec G304 G703 -- Trust this path, since it comes from the directory
+	// set by the person running the benchmarks.
 	f, err := os.Open(path)
 	require.NoError(tb, err)
 	defer func() { require.NoError(tb, f.Close()) }()
 
 	s := bufio.NewScanner(f)
 	for len(domains) < n && s.Scan() {
-		d, ok := strings.CutPrefix(s.Text(), "||")
-		if !ok {
-			continue
-		}
-
-		d, ok = strings.CutSuffix(d, "^")
-		if ok && !strings.ContainsAny(d, "*$/") {
+		if d, ok := blockedDomain(s.Text()); ok {
 			domains = append(domains, d)
 		}
 	}
@@ -93,12 +91,35 @@ func readBlockedDomains(tb testing.TB, path string, n int) (domains []string) {
 	return domains
 }
 
+// blockedDomain returns the domain blocked by line if it's a "||domain^" rule
+// or a hosts-file line for 0.0.0.0 or 127.0.0.1.
+func blockedDomain(line string) (domain string, ok bool) {
+	if d, isHosts := strings.CutPrefix(line, "0.0.0.0 "); isHosts {
+		domain = strings.TrimSpace(d)
+	} else if d, isHosts = strings.CutPrefix(line, "127.0.0.1 "); isHosts {
+		domain = strings.TrimSpace(d)
+	} else if d, ok = strings.CutPrefix(line, "||"); ok {
+		domain, ok = strings.CutSuffix(d, "^")
+		if !ok {
+			return "", false
+		}
+	}
+
+	if domain == "" || strings.ContainsAny(domain, "*$/# \t") || !strings.Contains(domain, ".") {
+		return "", false
+	}
+
+	return domain, true
+}
+
 // GenerateBlocklist writes a blocklist with n "||domain^" rules for random
 // domains to a temporary file and returns its path and the blocked domains.
 // The domains are the same for the same n.
 func GenerateBlocklist(tb testing.TB, n int) (path string, domains []string) {
 	tb.Helper()
 
+	// #nosec G404 -- Use a deterministic generator so that the generated data
+	// is the same in every run.
 	r := rand.New(rand.NewPCG(uint64(n), 0))
 	tlds := []string{"com", "net", "org", "io", "xyz", "info"}
 

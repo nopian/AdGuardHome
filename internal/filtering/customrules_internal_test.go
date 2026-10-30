@@ -6,13 +6,13 @@ import (
 	"net/netip"
 	"os"
 	"path/filepath"
+	"slices"
 	"strings"
 	"testing"
 
 	"github.com/AdguardTeam/AdGuardHome/internal/aghtest"
 	"github.com/AdguardTeam/AdGuardHome/internal/filtering/rulelist"
 	"github.com/AdguardTeam/golibs/testutil"
-	"github.com/AdguardTeam/urlfilter"
 	"github.com/AdguardTeam/urlfilter/rules"
 	"github.com/miekg/dns"
 	"github.com/stretchr/testify/assert"
@@ -32,6 +32,31 @@ var diffDomains = []string{
 	"ad22.example.com",
 	"www.example.com",
 	"example.com",
+	// Package urlfilter doesn't index the rules for domains that are 5
+	// characters or shorter, or shorter than 9 characters and start with
+	// "http".
+	"a.io",
+	"ab.cd",
+	"http.io",
+	"https.io",
+}
+
+// diffHosts are the additional hostnames used for the differential tests,
+// including ones with characters that affect how "||domain^" rules match.
+var diffHosts = []string{
+	"sub.example.org",
+	"deep.a.ads.example.org",
+	"ad7.example.net",
+	"sub.a.io",
+	"x.ab.cd",
+	"a+b.example.org",
+	"example.org+x",
+	"ads.example.org+x.example.net",
+	"a%b.example.org",
+	"a b.example.org",
+	"under_score.example.org",
+	"example.org_x",
+	"www.http.io",
 }
 
 // diffRuleTemplates are the rule templates used for the differential tests.
@@ -67,6 +92,18 @@ var diffRuleTemplates = []string{
 	"@@/^www\\./",
 	"||%s^$badfilter",
 	"||%s^$important,badfilter",
+	// Rules that look like plain domain rules but aren't.
+	"||%s^|",
+	"||%s",
+	"||*.%s^",
+	"||%s.^",
+	"||%s^$Important",
+	"||%s^$important,dnstype=A",
+	"@@||%s^$important,client='laptop'",
+	"||192.0.2.1^",
+	"||www.%s^",
+	"  ||%s^  ",
+	"\t@@||%s^$important",
 }
 
 // randomRules returns n random rules generated from diffRuleTemplates.  If
@@ -97,13 +134,14 @@ func newReferenceFilter(tb testing.TB, filters []Filter) (d *DNSFilter) {
 	d, _ = newForTest(tb, nil, nil)
 	tb.Cleanup(d.Close)
 
-	storage, err := newRuleStorage(filters)
+	// Compile all rules into urlfilter's engine.
+	engine, err := newListsEngine(filters, false)
 	require.NoError(tb, err)
 
 	d.engineLock.Lock()
 	defer d.engineLock.Unlock()
 
-	d.rulesStorage, d.filteringEngine = storage, urlfilter.NewDNSEngine(storage)
+	d.filteringEngine = engine
 
 	return d
 }
@@ -137,18 +175,23 @@ func TestDNSFilter_customRules_differential(t *testing.T) {
 	r := rand.New(rand.NewPCG(1, 2))
 	ctx := testutil.ContextWithTimeout(t, testTimeout)
 
-	hosts := append([]string{"sub.example.org", "deep.a.ads.example.org", "ad7.example.net"}, diffDomains...)
+	hosts := append(slices.Clone(diffHosts), diffDomains...)
 
 	for i := range iterations {
-		custom := randomRules(r, customRulesNum, false)
+		// Every fourth iteration, allow custom $badfilter rules, which makes
+		// the custom rules compiled together with the lists.
+		allowCustomBadfilter := i%4 == 3
+
+		// Use list IDs that don't follow the order of the lists.
+		custom := randomRules(r, customRulesNum, allowCustomBadfilter)
 		filters := []Filter{{
 			ID:   rulelist.IDCustom,
 			Data: []byte(strings.Join(custom, "\n")),
 		}, {
-			ID:   1,
+			ID:   5,
 			Data: []byte(strings.Join(randomRules(r, listRulesNum, true), "\n")),
 		}, {
-			ID:   2,
+			ID:   3,
 			Data: []byte(strings.Join(randomRules(r, listRulesNum, true), "\n")),
 		}}
 
@@ -156,32 +199,38 @@ func TestDNSFilter_customRules_differential(t *testing.T) {
 
 		d, _ := newForTest(t, nil, nil)
 		require.NoError(t, d.initFiltering(ctx, nil, filters, 0))
-		require.NotNil(t, d.customRules, "custom rules must be compiled separately")
+		if !allowCustomBadfilter {
+			require.NotNil(t, d.customRules, "custom rules must be compiled separately")
+		}
 
 		for _, host := range hosts {
-			for _, qt := range diffQTypes {
-				for si, setts := range diffSettings {
-					want, wantErr := ref.matchHost(host, qt, setts)
-					got, gotErr := d.matchHost(host, qt, setts)
-
-					msg := fmt.Sprintf(
-						"iteration %d, host %q, qtype %s, settings %d\ncustom:\n%s\nlist 1:\n%s\nlist 2:\n%s",
-						i,
-						host,
-						dns.Type(qt),
-						si,
-						filters[0].Data,
-						filters[1].Data,
-						filters[2].Data,
-					)
-					require.Equal(t, wantErr, gotErr, msg)
-
-					require.Equal(t, want, got, msg)
-				}
-			}
+			requireSameMatches(t, ref, d, host, fmt.Sprintf(
+				"iteration %d\ncustom:\n%s\nlist 5:\n%s\nlist 3:\n%s",
+				i,
+				filters[0].Data,
+				filters[1].Data,
+				filters[2].Data,
+			))
 		}
 
 		d.Close()
+	}
+}
+
+// requireSameMatches requires that d matches host the same way as ref for all
+// diffQTypes and diffSettings.
+func requireSameMatches(tb testing.TB, ref, d *DNSFilter, host, msgPrefix string) {
+	tb.Helper()
+
+	for _, qt := range diffQTypes {
+		for si, setts := range diffSettings {
+			want, wantErr := ref.matchHost(host, qt, setts)
+			got, gotErr := d.matchHost(host, qt, setts)
+
+			msg := fmt.Sprintf("host %q, qtype %s, settings %d, %s", host, dns.Type(qt), si, msgPrefix)
+			require.Equal(tb, wantErr, gotErr, msg)
+			require.Equal(tb, want, got, msg)
+		}
 	}
 }
 

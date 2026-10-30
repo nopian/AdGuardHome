@@ -2079,6 +2079,7 @@ func BenchmarkServer_udp(b *testing.B) {
 
 	b.SetParallelism(8)
 	b.ReportAllocs()
+	b.ResetTimer()
 	b.RunParallel(func(pb *testing.PB) {
 		conn, err := dns.Dial("udp", addr)
 		if !assert.NoError(b, err) {

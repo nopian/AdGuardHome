@@ -12,7 +12,6 @@ import (
 	"github.com/AdguardTeam/golibs/errors"
 	"github.com/AdguardTeam/golibs/logutil/slogutil"
 	"github.com/AdguardTeam/urlfilter"
-	"github.com/AdguardTeam/urlfilter/filterlist"
 	"github.com/AdguardTeam/urlfilter/rules"
 )
 
@@ -25,11 +24,8 @@ const errStaleCustomRules errors.Error = "custom rules are stale"
 // engine separate from the blocklists, so that changing them only requires
 // recompiling a few rules instead of all the blocklists.
 type customRules struct {
-	// storage contains the custom rules.  It must not be nil.
-	storage *filterlist.RuleStorage
-
 	// engine matches the custom rules.  It must not be nil.
-	engine *urlfilter.DNSEngine
+	engine *listsEngine
 
 	// hosts are the hosts-file style custom rules by hostname, in the order in
 	// which they appear in the rules.  See [customRules.matchWithLists].
@@ -43,22 +39,23 @@ type customRules struct {
 
 // newCustomRules compiles the custom filtering rules from data.
 func newCustomRules(data []byte) (cr *customRules, err error) {
-	storage, err := newRuleStorage([]Filter{{
+	engine, err := newListsEngine([]Filter{{
 		ID:   rulelist.IDCustom,
 		Data: data,
-	}})
+	}}, true)
 	if err != nil {
 		// Don't wrap the error, because it's informative enough as is.
 		return nil, err
 	}
 
 	cr = &customRules{
-		storage: storage,
-		engine:  urlfilter.NewDNSEngine(storage),
-		hosts:   map[string][]*rules.HostRule{},
+		engine: engine,
+		hosts:  map[string][]*rules.HostRule{},
 	}
 
-	scanner := storage.NewRuleStorageScanner()
+	// Plain domain rules are neither hosts-file style rules nor $badfilter
+	// rules, so only scan the remaining ones.
+	scanner := engine.storage.NewRuleStorageScanner()
 	for scanner.Scan() {
 		r, _ := scanner.Rule()
 		switch r := r.(type) {
@@ -85,7 +82,7 @@ func (cr *customRules) close(ctx context.Context, l *slog.Logger) {
 		return
 	}
 
-	err := cr.storage.Close()
+	err := cr.engine.Close()
 	if err != nil {
 		l.ErrorContext(ctx, "closing custom rules storage", slogutil.KeyError, err)
 	}
@@ -94,15 +91,15 @@ func (cr *customRules) close(ctx context.Context, l *slog.Logger) {
 // matchWithLists matches req against the custom rules and the rules in lists,
 // producing the same result as a single [urlfilter.DNSEngine] containing both
 // the custom rules and the rules from lists, as long as the custom rules don't
-// contain $badfilter rules.  The network rules in res are sorted with
-// [sortNetworkRules].  cr and lists must not be nil.
+// contain $badfilter rules.  The network rules in res are normalized with
+// [normalizeNetworkRules].  cr and lists must not be nil.
 //
 // The network rules from both engines are combined and the resulting rule is
 // chosen by [rules.GetDNSBasicRule], the same function that
 // [urlfilter.DNSEngine] uses.  When no network rule is chosen, the
 // hosts-file style rules are used, with the custom ones first.
 func (cr *customRules) matchWithLists(
-	lists *urlfilter.DNSEngine,
+	lists *listsEngine,
 	req *urlfilter.DNSRequest,
 ) (res *urlfilter.DNSResult, matched bool) {
 	res = &urlfilter.DNSResult{}
@@ -116,8 +113,7 @@ func (cr *customRules) matchWithLists(
 	listsRes := &urlfilter.DNSResult{}
 	lists.MatchRequestInto(req, listsRes)
 
-	res.NetworkRules = append(res.NetworkRules, listsRes.NetworkRules...)
-	sortNetworkRules(res.NetworkRules)
+	res.NetworkRules = normalizeNetworkRules(appendNewUnindexed(res.NetworkRules, listsRes.NetworkRules))
 	res.NetworkRule = rules.GetDNSBasicRule(res.NetworkRules)
 	if res.NetworkRule != nil {
 		res.HostRulesV4, res.HostRulesV6 = nil, nil
@@ -141,23 +137,86 @@ func (cr *customRules) matchWithLists(
 	return res, len(res.HostRulesV4) > 0 || len(res.HostRulesV6) > 0
 }
 
-// sortNetworkRules sorts the matched network rules by the filter list ID, so
-// that the custom rules go first, and then by text.  Both
-// [rules.GetDNSBasicRule] and the processing of $dnsrewrite rules choose the
-// first one of the rules with the same priority, so this makes the result
-// independent of the internal order of the engines, which changes whenever any
-// rule is added or removed.
-func sortNetworkRules(nrs []*rules.NetworkRule) {
-	if len(nrs) < 2 {
-		return
+// appendNewUnindexed appends the rules from lists to custom, except for the
+// unindexed rules, see [isUnindexedRule], that have the same text as a rule in
+// custom.  A single [urlfilter.DNSEngine] ignores such duplicates.
+func appendNewUnindexed(custom, lists []*rules.NetworkRule) (res []*rules.NetworkRule) {
+	res = custom
+	customLen := len(custom)
+	for _, nr := range lists {
+		if isUnindexedRule(nr) && slices.ContainsFunc(res[:customLen], func(cnr *rules.NetworkRule) (ok bool) {
+			return cnr.Text() == nr.Text()
+		}) {
+			continue
+		}
+
+		res = append(res, nr)
 	}
 
-	slices.SortStableFunc(nrs, func(a, b *rules.NetworkRule) (res int) {
-		return cmp.Or(
-			cmp.Compare(a.GetFilterListID(), b.GetFilterListID()),
-			strings.Compare(a.Text(), b.Text()),
-		)
+	return res
+}
+
+// isUnindexedRule returns true if package urlfilter doesn't index the
+// host-level network rule nr by its shortcut, in which case it ignores the
+// rules with the same text as an already added one, even from other lists.
+// See [isUnindexedDomain].
+func isUnindexedRule(nr *rules.NetworkRule) (ok bool) {
+	sc := nr.Shortcut
+	if len(sc) <= 5 {
+		return true
+	}
+
+	return slices.ContainsFunc(anyURLShortcuts, func(p anyURLShortcut) (isAny bool) {
+		return len(sc) <= p.maxLen && strings.HasPrefix(sc, p.prefix)
 	})
+}
+
+// anyURLShortcut describes the shortcuts that package urlfilter considers to
+// match too many URLs to index them.
+type anyURLShortcut struct {
+	// prefix is the prefix of such shortcuts.
+	prefix string
+
+	// maxLen is the maximum length of such shortcuts.
+	maxLen int
+}
+
+// anyURLShortcuts are the shortcuts that package urlfilter doesn't index.
+var anyURLShortcuts = []anyURLShortcut{
+	{prefix: "ws:", maxLen: len("ws://")},
+	{prefix: "wss:", maxLen: len("wss://")},
+	{prefix: "|ws", maxLen: len("|wss://")},
+	{prefix: "http", maxLen: len("https://")},
+	{prefix: "|http", maxLen: len("|https://")},
+}
+
+// normalizeNetworkRules sorts the matched network rules by the filter list ID,
+// so that the custom rules go first, and then by text, and removes the
+// duplicates.  Both [rules.GetDNSBasicRule] and the processing of $dnsrewrite
+// rules choose the first one of the rules with the same priority, and
+// [urlfilter.DNSEngine] can return the same rule several times, depending on
+// how its index is laid out.  This makes the result independent of the
+// internal state of the engines, which changes whenever any rule is added or
+// removed.
+func normalizeNetworkRules(nrs []*rules.NetworkRule) (res []*rules.NetworkRule) {
+	if len(nrs) < 2 {
+		return nrs
+	}
+
+	slices.SortStableFunc(nrs, compareNetworkRules)
+
+	return slices.CompactFunc(nrs, func(a, b *rules.NetworkRule) (ok bool) {
+		return compareNetworkRules(a, b) == 0
+	})
+}
+
+// compareNetworkRules compares network rules by the filter list ID and then by
+// text.
+func compareNetworkRules(a, b *rules.NetworkRule) (res int) {
+	return cmp.Or(
+		cmp.Compare(a.GetFilterListID(), b.GetFilterListID()),
+		strings.Compare(a.Text(), b.Text()),
+	)
 }
 
 // hostRules returns the hosts-file style custom rules for hostname, split by
@@ -322,26 +381,24 @@ func (d *DNSFilter) installCustomRules(ctx context.Context, cr *customRules, gen
 
 // engines are the compiled blocklists and allowlists.
 type engines struct {
-	// blockStorage contains the rules for block.
-	blockStorage *filterlist.RuleStorage
-
 	// block matches the blocklists.  It also contains the custom rules when
 	// they aren't compiled separately.
-	block *urlfilter.DNSEngine
-
-	// allowStorage contains the rules for allow.
-	allowStorage *filterlist.RuleStorage
+	block *listsEngine
 
 	// allow matches the allowlists.
-	allow *urlfilter.DNSEngine
+	allow *listsEngine
 }
 
 // close releases the resources of e.
 func (e *engines) close(ctx context.Context, l *slog.Logger) {
-	for _, s := range []*filterlist.RuleStorage{e.blockStorage, e.allowStorage} {
-		err := s.Close()
+	for _, le := range []*listsEngine{e.block, e.allow} {
+		if le == nil {
+			continue
+		}
+
+		err := le.Close()
 		if err != nil {
-			l.ErrorContext(ctx, "closing rules storage", slogutil.KeyError, err)
+			l.ErrorContext(ctx, "closing filtering engine", slogutil.KeyError, err)
 		}
 	}
 }
@@ -360,8 +417,7 @@ func (d *DNSFilter) installEngines(ctx context.Context, e *engines, cr *customRu
 	}
 
 	d.reset(ctx)
-	d.rulesStorage, d.filteringEngine = e.blockStorage, e.block
-	d.rulesStorageAllow, d.filteringEngineAllow = e.allowStorage, e.allow
+	d.filteringEngine, d.filteringEngineAllow = e.block, e.allow
 
 	if cr != nil && gen < d.installedCustomGen {
 		// Newer custom rules have been installed while the blocklists were
