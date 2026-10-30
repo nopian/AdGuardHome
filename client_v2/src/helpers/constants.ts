@@ -96,7 +96,7 @@ export const MAX_PORT = 65535;
 export const EMPTY_DATE = '0001-01-01T00:00:00Z';
 
 export const DEBOUNCE_TIMEOUT = 300;
-export const DEBOUNCE_FILTER_TIMEOUT = 500;
+export const DEBOUNCE_FILTER_TIMEOUT = 150;
 export const CHECK_TIMEOUT = 1000;
 
 export const UNSAFE_PORTS = [

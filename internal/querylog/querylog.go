@@ -166,6 +166,7 @@ func newQueryLog(conf Config) (l *queryLog, err error) {
 		conf:    &Config{},
 		confMu:  &sync.RWMutex{},
 		logFile: filepath.Join(conf.BaseDir, queryLogFileName),
+		index:   &searchIndex{},
 
 		anonymizer: conf.Anonymizer,
 	}

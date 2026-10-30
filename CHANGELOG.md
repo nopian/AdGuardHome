@@ -36,6 +36,12 @@ NOTE: Add new changes BELOW THIS COMMENT.
 
 - Blocked services are now matched using an index of their domains instead of checking every rule of every blocked service for every request.
 
+- Searching the query log now uses an in-memory index of the log files, so a search only reads the parts of the log that can contain matches, and a single request covers the whole log.  With a million records, a search for a rare domain takes milliseconds instead of most of a second and about 20 requests.  The index takes about 7 bytes per record and is built in the background when AdGuard Home starts.
+
+- Filtering the query log by status or reason no longer decodes the records that can't match.
+
+- The new web interface now starts searching the query log 150 ms after typing instead of 500 ms, and ignores the late results of earlier searches.
+
 - The default value of `filtering.blocked_response_ttl` is now 1 second instead of 10, so that clients don't keep using a cached blocked response long after the domain has been unblocked.  Existing configurations are not changed.
 
 - Blocking or unblocking a domain from the query log in the web interface now updates the custom filtering rules on the server instead of replacing them with a copy held by the browser, so changes made elsewhere are no longer overwritten.
@@ -47,6 +53,8 @@ NOTE: Add new changes BELOW THIS COMMENT.
 - Searching the query log scanning the same records again on every following page when the matches are sparse, which made searches for rare terms up to twice as slow.
 
 - Searching the query log stopping early, as if the end of the log had been reached, when the last scanned record belonged to an ignored domain or client.
+
+- Rotating the query log not being synchronized with writing to it.
 
 - Incorrect behaviour on the first launch with the `--check-config` flag.
 

@@ -90,17 +90,32 @@ func (l *queryLog) flushToFile(ctx context.Context, b *bytes.Buffer) (err error)
 
 	defer func() { err = errors.WithDeferred(err, f.Close()) }()
 
+	start := int64(-1)
+	if fi, statErr := f.Stat(); statErr == nil {
+		start = fi.Size()
+	}
+
 	n, err := f.Write(b.Bytes())
 	if err != nil {
+		l.index.invalidate()
+
 		return fmt.Errorf("writing to file %q: %w", filename, err)
 	}
 
 	l.logger.DebugContext(ctx, "flushed to file", "file", filename, "size", datasize.ByteSize(n))
 
+	if !l.index.appendCurrent(start, b.Bytes()) {
+		l.logger.DebugContext(ctx, "search index doesn't match the file; rebuilding")
+		l.startIndexBuild(ctx)
+	}
+
 	return nil
 }
 
 func (l *queryLog) rotate(ctx context.Context) error {
+	l.fileWriteLock.Lock()
+	defer l.fileWriteLock.Unlock()
+
 	from := l.logFile
 	to := l.logFile + ".1"
 
@@ -116,6 +131,8 @@ func (l *queryLog) rotate(ctx context.Context) error {
 	}
 
 	l.logger.DebugContext(ctx, "renamed log file", "from", from, "to", to)
+
+	l.index.rotate()
 
 	return nil
 }
