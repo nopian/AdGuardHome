@@ -340,7 +340,7 @@ var config = &configuration{
 	Filtering: &filtering.Config{
 		ProtectionEnabled:  true,
 		BlockingMode:       filtering.BlockingModeDefault,
-		BlockedResponseTTL: 10, // in seconds
+		BlockedResponseTTL: 1, // in seconds
 
 		FilteringEnabled:           true,
 		FiltersUpdateIntervalHours: 24,

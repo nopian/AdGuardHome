@@ -1,7 +1,6 @@
 import { createAction } from 'redux-actions';
 import i18next from 'i18next';
 
-import endsWith from 'lodash/endsWith';
 import escapeRegExp from 'lodash/escapeRegExp';
 import React from 'react';
 import { compose } from 'redux';
@@ -26,7 +25,7 @@ import { fetchRequest } from '../api/fetch';
 import { getTlsStatus } from './encryption';
 import apiClient from '../api/Api';
 import { addErrorToast, addNoticeToast, addSuccessToast } from './toasts';
-import { getFilteringStatus, setRules } from './filtering';
+import { editRules } from './filtering';
 
 export const toggleSettingStatus = createAction('SETTING_STATUS_TOGGLE');
 export const showSettingsFailure = createAction('SETTINGS_FAILURE_SHOW');
@@ -714,8 +713,6 @@ export const toggleBlocking =
         const baseUnblockingRule = baseUnblocking || `@@${baseBlockingRule}`;
         const { userRules } = getState().filtering;
 
-        const lineEnding = !endsWith(userRules, '\n') ? '\n' : '';
-
         const blockingRule = type === BLOCK_ACTIONS.BLOCK ? baseUnblockingRule : baseBlockingRule;
         const unblockingRule = type === BLOCK_ACTIONS.BLOCK ? baseBlockingRule : baseUnblockingRule;
         const preparedBlockingRule = new RegExp(`(^|\n)${escapeRegExp(blockingRule)}($|\n)`);
@@ -724,21 +721,23 @@ export const toggleBlocking =
         const matchPreparedBlockingRule = userRules.match(preparedBlockingRule);
         const matchPreparedUnblockingRule = userRules.match(preparedUnblockingRule);
 
+        // Change only the affected rule on the server, so that the rules changed
+        // elsewhere aren't overwritten.
         if (matchPreparedBlockingRule) {
-            await dispatch(setRules(userRules.replace(`${blockingRule}`, '')));
-            dispatch(addSuccessToast(i18next.t('rule_removed_from_custom_filtering_toast', { rule: blockingRule })));
+            if (await dispatch(editRules([], [blockingRule]))) {
+                dispatch(
+                    addSuccessToast(i18next.t('rule_removed_from_custom_filtering_toast', { rule: blockingRule })),
+                );
+            }
         } else if (!matchPreparedUnblockingRule) {
-            await dispatch(setRules(`${userRules}${lineEnding}${unblockingRule}\n`));
+            if (await dispatch(editRules([unblockingRule], []))) {
+                dispatch(
+                    addSuccessToast(i18next.t('rule_added_to_custom_filtering_toast', { rule: unblockingRule })),
+                );
+            }
+        } else {
             dispatch(addSuccessToast(i18next.t('rule_added_to_custom_filtering_toast', { rule: unblockingRule })));
-        } else if (matchPreparedUnblockingRule) {
-            dispatch(addSuccessToast(i18next.t('rule_added_to_custom_filtering_toast', { rule: unblockingRule })));
-            return;
-        } else if (!matchPreparedBlockingRule) {
-            dispatch(addSuccessToast(i18next.t('rule_removed_from_custom_filtering_toast', { rule: blockingRule })));
-            return;
         }
-
-        dispatch(getFilteringStatus());
     };
 
 export const toggleBlockingForClient = (type: any, domain: any, client: any) => {

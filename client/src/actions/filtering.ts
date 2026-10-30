@@ -43,6 +43,24 @@ export const setRules = (rules: any) => async (dispatch: any) => {
     }
 };
 
+/**
+ * Adds and removes individual custom filtering rules.  Unlike setRules, it
+ * doesn't send the other rules, so it can't overwrite changes made elsewhere.
+ */
+export const editRules = (add: string[], remove: string[]) => async (dispatch: any) => {
+    dispatch(setRulesRequest());
+    try {
+        const { rules } = await apiClient.editRules({ add, remove });
+        dispatch(handleRulesChange({ userRules: rules.join('\n') }));
+        dispatch(setRulesSuccess());
+        return true;
+    } catch (error) {
+        dispatch(addErrorToast({ error }));
+        dispatch(setRulesFailure());
+        return false;
+    }
+};
+
 export const addFilterRequest = createAction('ADD_FILTER_REQUEST');
 export const addFilterFailure = createAction('ADD_FILTER_FAILURE');
 export const addFilterSuccess = createAction('ADD_FILTER_SUCCESS');

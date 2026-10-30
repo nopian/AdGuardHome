@@ -658,17 +658,45 @@ func (d *DNSFilter) load(ctx context.Context, flt *FilterYAML) (err error) {
 	return nil
 }
 
-// EnableFilters enables filters.
+// EnableFilters compiles the enabled filters together with the custom filtering
+// rules and installs them, asynchronously if async is true.
 func (d *DNSFilter) EnableFilters(async bool) {
-	d.conf.filtersMu.RLock()
-	defer d.conf.filtersMu.RUnlock()
+	ctx := context.TODO()
 
-	d.enableFiltersLocked(context.TODO(), async)
+	var err error
+	d.conf.filtersMu.RLock()
+	params := d.filtersToEnableLocked()
+	filteringEnabled := d.conf.FilteringEnabled
+	if async {
+		// Enqueue under the lock, so that concurrent calls enqueue the filters
+		// in the same order in which they read them.
+		err = d.setFilters(ctx, params.blockFilters, params.allowFilters, params.customGen, true)
+	}
+	d.conf.filtersMu.RUnlock()
+
+	if !async {
+		// Don't hold the lock while compiling, which can take seconds, so that
+		// changing the custom rules doesn't have to wait for it.
+		err = d.setFilters(ctx, params.blockFilters, params.allowFilters, params.customGen, false)
+		if errors.Is(err, errStaleCustomRules) {
+			d.logger.DebugContext(ctx, "recompiling filters", slogutil.KeyError, err)
+			d.EnableFilters(false)
+
+			return
+		}
+	}
+
+	if err != nil {
+		d.logger.ErrorContext(ctx, "enabling filters", slogutil.KeyError, err)
+	}
+
+	d.SetEnabled(filteringEnabled)
 }
 
-// enableFiltersLocked enables filters under the conf.filtersMu lock.
-func (d *DNSFilter) enableFiltersLocked(ctx context.Context, async bool) {
-	filters := make([]Filter, 1, len(d.conf.Filters)+len(d.conf.WhitelistFilters)+1)
+// filtersToEnableLocked returns the enabled filters and the custom filtering
+// rules.  d.conf.filtersMu must be locked for reading.
+func (d *DNSFilter) filtersToEnableLocked() (params *filtersInitializerParams) {
+	filters := make([]Filter, 1, len(d.conf.Filters)+1)
 	filters[0] = Filter{
 		ID:   rulelist.IDCustom,
 		Data: []byte(strings.Join(d.conf.UserRules, "\n")),
@@ -697,12 +725,11 @@ func (d *DNSFilter) enableFiltersLocked(ctx context.Context, async bool) {
 		})
 	}
 
-	err := d.setFilters(ctx, filters, allowFilters, async)
-	if err != nil {
-		d.logger.ErrorContext(ctx, "enabling filters", slogutil.KeyError, err)
+	return &filtersInitializerParams{
+		allowFilters: allowFilters,
+		blockFilters: filters,
+		customGen:    d.customGen,
 	}
-
-	d.SetEnabled(d.conf.FilteringEnabled)
 }
 
 // ApplyAdditionalFiltering enhances the provided filtering settings with

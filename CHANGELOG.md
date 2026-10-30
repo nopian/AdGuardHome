@@ -22,7 +22,27 @@ NOTE: Add new changes BELOW THIS COMMENT.
 
 - Go version has been updated to prevent the possibility of exploiting the Go vulnerabilities fixed in [1.27.2][go-1.27.2].
 
+### Added
+
+- New HTTP API `POST /control/filtering/edit_rules` that adds and removes individual custom filtering rules.  See `openapi/CHANGELOG.md`.
+
+### Changed
+
+- Custom filtering rules are now compiled separately from the blocklists, so changing them, for example by unblocking a domain from the query log, takes effect in milliseconds instead of after recompiling all blocklists.  Custom rules containing `$badfilter` rules are still compiled together with the blocklists.
+
+- When several matching rules have the same priority, the custom rule is now reported, and otherwise the one from the blocklist with the lowest ID.  The same order is used to resolve conflicting `$dnsrewrite` rules.  Previously, the choice depended on the internal order of the filtering engine, which could change whenever any rule was edited.
+
+- The default value of `filtering.blocked_response_ttl` is now 1 second instead of 10, so that clients don't keep using a cached blocked response long after the domain has been unblocked.  Existing configurations are not changed.
+
+- Blocking or unblocking a domain from the query log in the web interface now updates the custom filtering rules on the server instead of replacing them with a copy held by the browser, so changes made elsewhere are no longer overwritten.
+
 ### Fixed
+
+- A data race when setting custom filtering rules using `POST /control/filtering/set_rules`.
+
+- Searching the query log scanning the same records again on every following page when the matches are sparse, which made searches for rare terms up to twice as slow.
+
+- Searching the query log stopping early, as if the end of the log had been reached, when the last scanned record belonged to an ignored domain or client.
 
 - Incorrect behaviour on the first launch with the `--check-config` flag.
 

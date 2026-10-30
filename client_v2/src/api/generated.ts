@@ -22,6 +22,8 @@ import type {
     DhcpStaticLeaseBody,
     DhcpStatus,
     DnsInfo200,
+    EditRulesRequest,
+    EditRulesResponse,
     FilterCheckHostResponse,
     FilterConfig,
     FilterRefreshRequest,
@@ -766,6 +768,26 @@ export const filteringSetRules = async (
         method: 'POST',
         headers: { 'Content-Type': 'application/json', ...options?.headers },
         body: JSON.stringify(setRulesRequest),
+    });
+};
+
+export const getFilteringEditRulesUrl = () => {
+    return `control/filtering/edit_rules`;
+};
+
+/**
+ * Unlike `/filtering/set_rules`, it only changes the given rules, so concurrent edits don't overwrite each other.  The change takes effect before the response is sent.
+ * @summary Add and remove individual user-defined filter rules
+ */
+export const filteringEditRules = async (
+    editRulesRequest?: EditRulesRequest,
+    options?: RequestInit,
+): Promise<EditRulesResponse> => {
+    return customFetch<EditRulesResponse>(getFilteringEditRulesUrl(), {
+        ...options,
+        method: 'POST',
+        headers: { 'Content-Type': 'application/json', ...options?.headers },
+        body: JSON.stringify(editRulesRequest),
     });
 };
 

@@ -82,6 +82,8 @@ class Api {
 
     FILTERING_SET_RULES = { path: 'filtering/set_rules', method: 'POST' };
 
+    FILTERING_EDIT_RULES = { path: 'filtering/edit_rules', method: 'POST' };
+
     FILTERING_REFRESH = { path: 'filtering/refresh', method: 'POST' };
 
     FILTERING_SET_URL = { path: 'filtering/set_url', method: 'POST' };
@@ -127,6 +129,14 @@ class Api {
         const { path, method } = this.FILTERING_SET_RULES;
         const parameters = {
             data: rules,
+        };
+        return this.makeRequest(path, method, parameters);
+    }
+
+    editRules(edit: { add?: string[]; remove?: string[] }) {
+        const { path, method } = this.FILTERING_EDIT_RULES;
+        const parameters = {
+            data: edit,
         };
         return this.makeRequest(path, method, parameters);
     }

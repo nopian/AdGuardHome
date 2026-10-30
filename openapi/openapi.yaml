@@ -762,6 +762,32 @@
       'responses':
         '200':
           'description': 'OK.'
+  '/filtering/edit_rules':
+    'post':
+      'tags':
+      - 'filtering'
+      'operationId': 'filteringEditRules'
+      'summary': 'Add and remove individual user-defined filter rules'
+      'description': >
+        Unlike `/filtering/set_rules`, it only changes the given rules, so
+        concurrent edits don't overwrite each other.  The change takes effect
+        before the response is sent.
+      'requestBody':
+        'content':
+          'application/json':
+            'schema':
+              '$ref': '#/components/schemas/EditRulesRequest'
+        'description': 'Custom filtering rules to add and remove.'
+      'responses':
+        '200':
+          'description': 'OK.'
+          'content':
+            'application/json':
+              'schema':
+                '$ref': '#/components/schemas/EditRulesResponse'
+        '400':
+          'description': >
+            A rule is empty or contains a line break.
   '/filtering/check_host':
     'get':
       'tags':
@@ -1881,6 +1907,42 @@
           'items':
             'type': 'string'
           'type': 'array'
+      'type': 'object'
+    'EditRulesRequest':
+      'description': >
+        Custom filtering rules editing request.  Rules are compared with the
+        surrounding spaces trimmed.  The rules in `remove` are removed first,
+        then the rules in `add` are appended unless already present.
+      'example':
+        'add':
+        - '@@||www.example.com^$important'
+        'remove':
+        - '||www.example.com^$important'
+      'properties':
+        'add':
+          'description': 'Rules to append unless already present.'
+          'items':
+            'type': 'string'
+          'type': 'array'
+        'remove':
+          'description': 'Rules to remove.'
+          'items':
+            'type': 'string'
+          'type': 'array'
+      'type': 'object'
+    'EditRulesResponse':
+      'description': 'Custom filtering rules after the edit.'
+      'example':
+        'rules':
+        - '# comment'
+        - '@@||www.example.com^$important'
+      'properties':
+        'rules':
+          'items':
+            'type': 'string'
+          'type': 'array'
+      'required':
+      - 'rules'
       'type': 'object'
     'GetVersionRequest':
       'type': 'object'

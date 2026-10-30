@@ -51,6 +51,8 @@ export * from './dNSConfigBlockingMode';
 export * from './dNSConfigUpstreamMode';
 export * from './dnsInfo200';
 export * from './dnsQuestion';
+export * from './editRulesRequest';
+export * from './editRulesResponse';
 export * from './error';
 export * from './filter';
 export * from './filterCheckHostResponse';
