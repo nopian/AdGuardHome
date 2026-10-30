@@ -15,6 +15,7 @@ import (
 	"github.com/AdguardTeam/AdGuardHome/internal/dhcpd"
 	"github.com/AdguardTeam/AdGuardHome/internal/dhcpsvc"
 	"github.com/AdguardTeam/AdGuardHome/internal/dnsforward"
+	"github.com/AdguardTeam/AdGuardHome/internal/filtering"
 	"github.com/AdguardTeam/AdGuardHome/internal/whois"
 	"github.com/AdguardTeam/golibs/errors"
 	"github.com/AdguardTeam/golibs/hostsfile"
@@ -1469,4 +1470,83 @@ func BenchmarkStorage_Find(b *testing.B) {
 	//	BenchmarkStorage_Find/ip_address-8        	 6831823	       168.6 ns/op	     248 B/op	       2 allocs/op
 	//	BenchmarkStorage_Find/subnet-8            	 7209050	       167.5 ns/op	     256 B/op	       2 allocs/op
 	//	BenchmarkStorage_Find/mac_address-8       	 5776131	       199.7 ns/op	     256 B/op	       3 allocs/op
+}
+
+func TestStorage_FindLoose_zoneLifecycle(t *testing.T) {
+	ctx := testutil.ContextWithTimeout(t, testTimeout)
+	s := newStorage(t, nil)
+
+	ipWithZone := netip.MustParseAddr("fe80::1%eth0")
+	ip := ipWithZone.WithZone("")
+
+	newClient := func() (c *client.Persistent) {
+		return &client.Persistent{
+			Name: "client_with_zone",
+			UID:  client.NewUID(),
+			IPs:  []netip.Addr{ipWithZone},
+		}
+	}
+
+	for range 2 {
+		require.NoError(t, s.Add(ctx, newClient()))
+
+		c, ok := s.FindLoose(ip, "")
+		require.True(t, ok)
+		assert.Equal(t, "client_with_zone", c.Name)
+
+		require.True(t, s.RemoveByName(ctx, "client_with_zone"))
+
+		_, ok = s.FindLoose(ip, "")
+		assert.False(t, ok)
+	}
+}
+
+func TestStorage_concurrentLookups(t *testing.T) {
+	ctx := testutil.ContextWithTimeout(t, testTimeout)
+	s := newStorage(t, nil)
+
+	ip := netip.MustParseAddr("192.0.2.1")
+
+	done := make(chan struct{})
+	wg := &sync.WaitGroup{}
+	for range 4 {
+		wg.Go(func() {
+			params := &client.FindParams{RemoteIP: ip}
+			for {
+				select {
+				case <-done:
+					return
+				default:
+				}
+
+				s.ApplyClientFiltering("", ip, &filtering.Settings{})
+				_ = s.CustomUpstreamConfig("", ip)
+				_, _ = s.IgnoresQueryLog(ip, ip.String())
+				_, _ = s.IgnoresStatistics(params)
+			}
+		})
+	}
+
+	for i := range 100 {
+		require.NoError(t, s.Add(ctx, &client.Persistent{
+			Name:             "client",
+			UID:              client.NewUID(),
+			IPs:              []netip.Addr{ip},
+			IgnoreQueryLog:   i%2 == 0,
+			IgnoreStatistics: i%3 == 0,
+		}))
+
+		ignore, found := s.IgnoresQueryLog(ip, ip.String())
+		require.True(t, found)
+		assert.Equal(t, i%2 == 0, ignore)
+
+		ignore, found = s.IgnoresStatistics(&client.FindParams{RemoteIP: ip})
+		require.True(t, found)
+		assert.Equal(t, i%3 == 0, ignore)
+
+		require.True(t, s.RemoveByName(ctx, "client"))
+	}
+
+	close(done)
+	wg.Wait()
 }

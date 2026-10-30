@@ -109,6 +109,95 @@ func TestIsBlockedHost(t *testing.T) {
 	}
 }
 
+// accessTestHosts returns the hosts for checking the blocked hosts rules,
+// combined from labels that the rules contain.
+func accessTestHosts() (hosts []string) {
+	labels := []string{
+		"version", "bind", "id", "server", "hostname", "example", "org", "ads", "sub",
+		"x_y", "tracker", "my-tracker", "http", "p", "tt", "a", "xn--e1afmkfd",
+	}
+
+	for _, a := range labels {
+		hosts = append(hosts, a)
+		for _, b := range labels {
+			hosts = append(hosts, a+"."+b, a+b, a+"-"+b)
+			for _, c := range labels[:6] {
+				hosts = append(hosts, a+"."+b+"."+c)
+			}
+		}
+	}
+
+	return hosts
+}
+
+func TestIsBlockedHost_simpleRules(t *testing.T) {
+	testCases := []struct {
+		name       string
+		rules      []string
+		wantSimple bool
+	}{{
+		name:       "default",
+		rules:      []string{"version.bind", "id.server", "hostname.bind"},
+		wantSimple: true,
+	}, {
+		name:       "anchors",
+		rules:      []string{"||example.org^", "ads.", "-tracker", "x_y.example", "||sub.", "org^"},
+		wantSimple: true,
+	}, {
+		name:       "upper_case",
+		rules:      []string{"Example.ORG", "||ADS.example^"},
+		wantSimple: true,
+	}, {
+		name:       "empty",
+		rules:      []string{"", ""},
+		wantSimple: true,
+	}, {
+		name:       "scheme_part",
+		rules:      []string{"tt"},
+		wantSimple: false,
+	}, {
+		name:       "scheme_part_anchored",
+		rules:      []string{"||p^"},
+		wantSimple: false,
+	}, {
+		name:       "wildcard",
+		rules:      []string{"version.bind", "*.example.org"},
+		wantSimple: false,
+	}, {
+		name:       "modifier",
+		rules:      []string{"||example.org^$dnstype=HTTPS"},
+		wantSimple: false,
+	}, {
+		name:       "exception",
+		rules:      []string{"example.org", "@@||sub.example.org^"},
+		wantSimple: false,
+	}, {
+		name:       "space",
+		rules:      []string{" example.org"},
+		wantSimple: false,
+	}}
+
+	hosts := accessTestHosts()
+	for _, tc := range testCases {
+		t.Run(tc.name, func(t *testing.T) {
+			a, err := newAccessCtx(nil, nil, tc.rules)
+			require.NoError(t, err)
+
+			assert.Equal(t, tc.wantSimple, a.blockedHostsSimple)
+
+			ref := *a
+			ref.blockedHostsSimple = false
+
+			for _, host := range hosts {
+				for _, qt := range []rules.RRType{dns.TypeA, dns.TypeHTTPS} {
+					want := ref.isBlockedHost(host, qt)
+					require.Equal(t, want, a.isBlockedHost(host, qt), "host %q", host)
+				}
+			}
+		})
+	}
+}
+
 func TestIsBlockedIP(t *testing.T) {
 	clients := []string{
 		"1.2.3.4",
@@ -161,6 +250,32 @@ func TestIsBlockedIP(t *testing.T) {
 			blocked, rule := blockCtx.isBlockedIP(tc.ip)
 			assert.Equal(t, tc.wantBlocked, blocked)
 			assert.Equal(t, tc.wantRule, rule)
+		}
+	})
+}
+
+// BenchmarkAccessManager_isBlockedHost measures the check of every query
+// against the default disallowed domains.
+func BenchmarkAccessManager_isBlockedHost(b *testing.B) {
+	a, err := newAccessCtx(nil, nil, []string{"version.bind", "id.server", "hostname.bind"})
+	require.NoError(b, err)
+
+	const host = "www.example.com"
+
+	b.Run("engine", func(b *testing.B) {
+		ref := *a
+		ref.blockedHostsSimple = false
+
+		b.ReportAllocs()
+		for b.Loop() {
+			_ = ref.isBlockedHost(host, dns.TypeA)
+		}
+	})
+
+	b.Run("literals", func(b *testing.B) {
+		b.ReportAllocs()
+		for b.Loop() {
+			_ = a.isBlockedHost(host, dns.TypeA)
 		}
 	})
 }

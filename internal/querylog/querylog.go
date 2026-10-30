@@ -1,6 +1,7 @@
 package querylog
 
 import (
+	"context"
 	"fmt"
 	"log/slog"
 	"net"
@@ -15,6 +16,7 @@ import (
 	"github.com/AdguardTeam/AdGuardHome/internal/filtering"
 	"github.com/AdguardTeam/golibs/container"
 	"github.com/AdguardTeam/golibs/errors"
+	"github.com/AdguardTeam/golibs/logutil/slogutil"
 	"github.com/AdguardTeam/golibs/service"
 	"github.com/miekg/dns"
 )
@@ -59,6 +61,11 @@ type Config struct {
 
 	// FindClient returns client information by their IDs.
 	FindClient func(ids []string) (c *Client, err error)
+
+	// ShouldLogClient returns false if the queries of the client with the
+	// given IDs must not be logged.  It is called for every query, so it
+	// should be fast.  If nil, FindClient is used.
+	ShouldLogClient func(ids []string) (ok bool)
 
 	// BaseDir is the base directory for log files.
 	BaseDir string
@@ -150,6 +157,19 @@ func newQueryLog(conf Config) (l *queryLog, err error) {
 		}
 	}
 
+	shouldLogClient := conf.ShouldLogClient
+	if shouldLogClient == nil {
+		shouldLogClient = func(ids []string) (ok bool) {
+			c, findErr := findClient(ids)
+			if findErr != nil {
+				// TODO(s.chzhen):  Pass context.
+				conf.Logger.ErrorContext(context.TODO(), "finding client", slogutil.KeyError, findErr)
+			}
+
+			return c == nil || !c.IgnoreQueryLog
+		}
+	}
+
 	memSize := conf.MemSize
 	if memSize == 0 {
 		// If query log is enabled, we still need to write entries to a file.
@@ -158,8 +178,9 @@ func newQueryLog(conf Config) (l *queryLog, err error) {
 	}
 
 	l = &queryLog{
-		logger:     conf.Logger,
-		findClient: findClient,
+		logger:          conf.Logger,
+		findClient:      findClient,
+		shouldLogClient: shouldLogClient,
 
 		buffer: container.NewRingBuffer[*logEntry](memSize),
 

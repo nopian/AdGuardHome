@@ -187,10 +187,33 @@ Checks: `TestStatsCtx_dataFromCache` compares the cache with the original code, 
 
 ## Phase 5: per-query cleanup
 
-- Look up the client once per query and reuse it; today it happens 3–4 times, including a second access-list check.
-- Keep filtering settings as a read-only snapshot swapped on config changes instead of building a new settings object under a lock for every query.
-- Write query log entries straight into the new storage format, without the JSON step.
-- Expected: about 38 µs → 12 µs of server CPU per query.
+A profile of the whole server after Phases 1–4 showed that AdGuard Home's own handler only takes about 5 µs of the roughly 40 µs of CPU per query in `BenchmarkServer_udp` (which includes its client).  Most of the rest is in dnsproxy and the kernel, so the original 12 µs target isn't reachable from AdGuard Home's side.  That benchmark also uses an empty clients container, which hides the client lookups that production does for every query.  `BenchmarkClientsContainer_perQuery` measures those.
+
+What changed:
+
+- Client lookups: the client storage now uses a read-write lock, and the lookups made for every query (filtering settings, custom upstreams, query log and statistics settings) only lock it for reading, so they no longer serialize all queries.  `ApplyClientFiltering` didn't lock it at all, which was a data race with editing clients.
+- The statistics check no longer takes the clients container's exclusive lock, and the query log check no longer builds a full client description, which included a second access-list check, just to read one flag.  Both now read the flags without copying the client.
+- Looking up a client by an IP address without a zone no longer goes through all clients' addresses unless some of them have zones.
+- The custom upstream configuration of a client is read under the read lock unless it needs to be rebuilt.
+- The access-list check of the requested domain first checks if the domain contains any of the disallowed domains, when they're all simple, instead of preparing a urlfilter request for every query.
+
+Not done:
+
+- Looking up the client once per query: the four lookups are now cheap and parallel, and sharing one would require changing the interfaces of the filtering, query log, and statistics packages.
+- A settings snapshot: building the per-query settings takes a read lock and copies four fields, so there's nothing to gain.
+- A new query log format: Phase 3 kept the JSON files.
+
+Found in dnsproxy, not changed here: `Proxy.handleDNSRequest` formats every request and response with `dns.Msg.String` for a debug log message even when debug logging is off.  That's about 5.6 µs, or 13%, of the CPU per query in the benchmark.  Fixing it is a one-line check of the log level in dnsproxy, which would mean carrying a patched copy of the module in this repository.  Reusing goroutines for UDP packets instead of starting one per packet only saved about 0.4 µs.
+
+### Phase 5 results
+
+| Per query | Before | After |
+|---|---|---|
+| Client lookups, one core (`BenchmarkClientsContainer_perQuery`, 50 clients) | 1.7–2.1 µs, 8 allocations | 0.49 µs, 2 allocations |
+| Client lookups, four cores in parallel, time per query | 1.9 µs (no speed-up from more cores) | 0.41 µs |
+| Access-list check of the domain with the default list (`BenchmarkAccessManager_isBlockedHost`) | 560 ns, 2 allocations | 38 ns, 0 allocations |
+
+Checks: `TestStorage_concurrentLookups` runs the per-query lookups while clients are added and removed, and reports the old data race in `ApplyClientFiltering` under the race detector.  `TestClientsContainer_shouldLogClient` compares the new query log check with the old one.  `TestIsBlockedHost_simpleRules` compares the access-list check with and without the quick check over about 5,000 hosts and ten rule sets, including rules that disable it.  On the real binary, clients that ignore the query log or the statistics are still left out of them.
 
 ## UI
 

@@ -48,6 +48,9 @@ type index struct {
 
 	// uidToClient maps UID to the persistent client.
 	uidToClient map[UID]*Persistent
+
+	// zonedIPsNum is the number of IP addresses with zones in ipToUID.
+	zonedIPsNum int
 }
 
 // newIndex initializes the new instance of client index.
@@ -76,6 +79,10 @@ func (ci *index) add(c *Persistent) {
 	}
 
 	for _, ip := range c.IPs {
+		if _, ok := ci.ipToUID[ip]; !ok && ip.Zone() != "" {
+			ci.zonedIPsNum++
+		}
+
 		ci.ipToUID[ip] = c.UID
 	}
 
@@ -317,6 +324,14 @@ func (ci *index) findByIPWithoutZone(ip netip.Addr) (c *Persistent) {
 		return nil
 	}
 
+	// Most addresses have no zones, so only look through all of them if there
+	// are any.
+	if uid, ok := ci.ipToUID[ip]; ok && ip.Zone() == "" {
+		return ci.uidToClient[uid]
+	} else if ci.zonedIPsNum == 0 {
+		return nil
+	}
+
 	for addr, uid := range ci.ipToUID {
 		if addr.WithZone("") == ip {
 			return ci.uidToClient[uid]
@@ -336,6 +351,10 @@ func (ci *index) remove(c *Persistent) {
 	}
 
 	for _, ip := range c.IPs {
+		if _, ok := ci.ipToUID[ip]; ok && ip.Zone() != "" {
+			ci.zonedIPsNum--
+		}
+
 		delete(ci.ipToUID, ip)
 	}
 
