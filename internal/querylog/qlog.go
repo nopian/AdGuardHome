@@ -37,6 +37,10 @@ type queryLog struct {
 
 	findClient func(ids []string) (c *Client, err error)
 
+	// shouldLogClient returns false if the queries of the client must not be
+	// logged.  It must not be nil.
+	shouldLogClient func(ids []string) (ok bool)
+
 	// buffer contains recent log entries.  The entries in this buffer must not
 	// be modified.
 	buffer *container.RingBuffer[*logEntry]
@@ -315,17 +319,7 @@ func (l *queryLog) ShouldLog(host string, _, _ uint16, ids []string) bool {
 	l.confMu.RLock()
 	defer l.confMu.RUnlock()
 
-	c, err := l.findClient(ids)
-	if err != nil {
-		// TODO(s.chzhen):  Pass context.
-		l.logger.ErrorContext(context.TODO(), "finding client", slogutil.KeyError, err)
-	}
-
-	if c != nil && c.IgnoreQueryLog {
-		return false
-	}
-
-	return !l.isIgnored(host)
+	return l.shouldLogClient(ids) && !l.isIgnored(host)
 }
 
 // isIgnored returns true if the host is in the ignored domains list.  It

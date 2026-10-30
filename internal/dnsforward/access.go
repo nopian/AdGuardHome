@@ -29,9 +29,18 @@ type accessManager struct {
 	// TODO(s.chzhen):  Use [aghnet.IgnoreEngine].
 	blockedHostsEng *urlfilter.DNSEngine
 
+	// blockedHostsLiterals are the literal parts of the blocked hosts rules,
+	// one of which a host must contain to match any of the rules.  It is only
+	// used if blockedHostsSimple is true.
+	blockedHostsLiterals []string
+
 	// TODO(a.garipov): Create a type for an efficient tree set of IP networks.
 	allowedNets []netip.Prefix
 	blockedNets []netip.Prefix
+
+	// blockedHostsSimple is true if all blocked hosts rules are simple enough
+	// to be checked with blockedHostsLiterals first.
+	blockedHostsSimple bool
 }
 
 // processAccessClients is a helper for processing a list of client strings,
@@ -101,8 +110,48 @@ func newAccessCtx(allowed, blocked, blockedHosts []string) (a *accessManager, er
 	}
 
 	a.blockedHostsEng = urlfilter.NewDNSEngine(rulesStrg)
+	a.blockedHostsLiterals, a.blockedHostsSimple = ruleLiterals(blockedHosts)
 
 	return a, nil
+}
+
+// ruleLiterals returns the literal parts of rules, if all of them are simple,
+// that is, a domain-like pattern optionally surrounded by "||" and "^".  Such a
+// rule can only match a host that contains its literal part.
+func ruleLiterals(rules []string) (literals []string, ok bool) {
+	literals = make([]string, 0, len(rules))
+	for _, r := range rules {
+		if r == "" {
+			continue
+		}
+
+		lit := strings.TrimSuffix(strings.TrimPrefix(strings.ToLower(r), "||"), "^")
+
+		// The engine matches the rules against the host with the "http://"
+		// prefix, so a literal that is a part of it matches any host.
+		if lit == "" || strings.Contains("http", lit) || !isRuleLiteral(lit) {
+			return nil, false
+		}
+
+		literals = append(literals, lit)
+	}
+
+	return literals, true
+}
+
+// isRuleLiteral returns true if s only contains characters that a rule pattern
+// matches literally and that can be in a domain name.
+func isRuleLiteral(s string) (ok bool) {
+	for _, c := range []byte(s) {
+		switch {
+		case c >= 'a' && c <= 'z', c >= '0' && c <= '9', c == '.', c == '-', c == '_':
+			// Go on.
+		default:
+			return false
+		}
+	}
+
+	return true
 }
 
 // allowlistMode returns true if this *accessCtx is in the allowlist mode.
@@ -126,14 +175,28 @@ func (a *accessManager) isBlockedClientID(id string) (ok bool) {
 	return a.blockedClientIDs.Has(id)
 }
 
-// isBlockedHost returns true if host should be blocked.
+// isBlockedHost returns true if host should be blocked.  host must be in
+// lower case.
 func (a *accessManager) isBlockedHost(host string, qt rules.RRType) (ok bool) {
+	// Preparing a request for the engine takes most of the time, so first
+	// check if any rule can match.
+	if a.blockedHostsSimple && !containsAny(host, a.blockedHostsLiterals) {
+		return false
+	}
+
 	_, ok = a.blockedHostsEng.MatchRequest(&urlfilter.DNSRequest{
 		Hostname: host,
 		DNSType:  qt,
 	})
 
 	return ok
+}
+
+// containsAny returns true if s contains any of substrs.
+func containsAny(s string, substrs []string) (ok bool) {
+	return slices.ContainsFunc(substrs, func(sub string) (found bool) {
+		return strings.Contains(s, sub)
+	})
 }
 
 // isBlockedIP returns the status of the IP address blocking as well as the rule

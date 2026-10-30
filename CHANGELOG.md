@@ -44,6 +44,10 @@ NOTE: Add new changes BELOW THIS COMMENT.
 
 - Domains and clients with the same number of requests are now always shown in the same order in the dashboard statistics.
 
+- The client lookups made for every DNS query, for the filtering settings, the custom upstreams, and the query log and statistics settings, no longer take exclusive locks or copy the client, so they take about a quarter of the time and no longer serialize queries on multi-core machines.
+
+- Checking the requested domain against the disallowed domains of the access settings is now about 15 times faster when they're all plain domains, as with the default list.
+
 - The new web interface now starts searching the query log 150 ms after typing instead of 500 ms, and ignores the late results of earlier searches.
 
 - The default value of `filtering.blocked_response_ttl` is now 1 second instead of 10, so that clients don't keep using a cached blocked response long after the domain has been unblocked.  Existing configurations are not changed.
@@ -51,6 +55,8 @@ NOTE: Add new changes BELOW THIS COMMENT.
 - Blocking or unblocking a domain from the query log in the web interface now updates the custom filtering rules on the server instead of replacing them with a copy held by the browser, so changes made elsewhere are no longer overwritten.
 
 ### Fixed
+
+- A data race between applying a persistent client's filtering settings to a query and editing the persistent clients.
 
 - A data race when setting custom filtering rules using `POST /control/filtering/set_rules`.
 

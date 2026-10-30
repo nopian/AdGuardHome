@@ -155,6 +155,20 @@ func (m *upstreamManager) customUpstreamConfig(
 	return proxyConf
 }
 
+// currentCustomUpstreamConfig returns the custom client upstream configuration
+// and true if it doesn't need to be updated.  Otherwise, it returns false and
+// [upstreamManager.customUpstreamConfig] must be used.
+func (m *upstreamManager) currentCustomUpstreamConfig(
+	uid UID,
+) (proxyConf *proxy.CustomUpstreamConfig, ok bool) {
+	cliConf, ok := m.uidToCustomConf[uid]
+	if !ok || m.isConfigChanged(cliConf) {
+		return nil, false
+	}
+
+	return cliConf.proxyConf, true
+}
+
 // isConfigChanged returns true if the update is necessary for the custom client
 // upstream configuration.
 func (m *upstreamManager) isConfigChanged(cliConf *customUpstreamConfig) (ok bool) {

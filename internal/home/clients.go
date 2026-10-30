@@ -368,6 +368,22 @@ func (clients *clientsContainer) clientOrArtificial(
 	}, true
 }
 
+// shouldLogClient returns false if the persistent client with one of ids
+// ignores the query log.  It finds the client in the same way as
+// [clientsContainer.findMultiple], but without collecting the information that
+// the query log only needs for showing the client.
+func (clients *clientsContainer) shouldLogClient(ids []string) (ok bool) {
+	for _, id := range ids {
+		ip, _ := netip.ParseAddr(id)
+		ignore, found := clients.storage.IgnoresQueryLog(ip, id)
+		if found {
+			return !ignore
+		}
+	}
+
+	return true
+}
+
 // shouldCountClient is a wrapper around [client.Storage.Find] to make it a
 // valid client information finder for the statistics.  If no information about
 // the client is found, it returns true.  Values of ids must be either a valid
@@ -375,9 +391,8 @@ func (clients *clientsContainer) clientOrArtificial(
 //
 // TODO(s.chzhen):  Accept [client.FindParams].
 func (clients *clientsContainer) shouldCountClient(ids []string) (y bool) {
-	clients.lock.Lock()
-	defer clients.lock.Unlock()
-
+	// Don't lock clients.lock, since the storage is safe for concurrent use and
+	// this is called for every query.
 	params := &client.FindParams{}
 	for _, id := range ids {
 		err := params.Set(id)
@@ -388,9 +403,9 @@ func (clients *clientsContainer) shouldCountClient(ids []string) (y bool) {
 			continue
 		}
 
-		client, ok := clients.storage.Find(params)
-		if ok {
-			return !client.IgnoreStatistics
+		ignore, found := clients.storage.IgnoresStatistics(params)
+		if found {
+			return !ignore
 		}
 	}
 

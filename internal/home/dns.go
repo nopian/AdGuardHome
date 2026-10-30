@@ -82,6 +82,7 @@ func initDNS(
 		ConfigModifier:    confModifier,
 		HTTPReg:           httpReg,
 		FindClient:        globalContext.clients.findMultiple,
+		ShouldLogClient:   globalContext.clients.shouldLogClient,
 		BaseDir:           querylogDir,
 		AnonymizeClientIP: config.DNS.AnonymizeClientIP,
 		RotationIvl:       time.Duration(config.QueryLog.Interval),

@@ -130,8 +130,9 @@ type Storage struct {
 	// not be nil.
 	logger *slog.Logger
 
-	// mu protects indexes of persistent and runtime clients.
-	mu *sync.Mutex
+	// mu protects indexes of persistent and runtime clients.  The lookups made
+	// for every DNS query only lock it for reading.
+	mu *sync.RWMutex
 
 	// index contains information about persistent clients.
 	index *index
@@ -176,7 +177,7 @@ func NewStorage(ctx context.Context, conf *StorageConfig) (s *Storage, err error
 
 	s = &Storage{
 		logger:                 conf.Logger,
-		mu:                     &sync.Mutex{},
+		mu:                     &sync.RWMutex{},
 		index:                  newIndex(),
 		runtimeIndex:           newRuntimeIndex(),
 		upstreamManager:        newUpstreamManager(conf.BaseLogger, conf.Clock),
@@ -531,9 +532,33 @@ func (p *FindParams) Set(id string) (err error) {
 // Find represents the parameters for searching a client.  params must not be
 // nil and must have at least one non-empty field.
 func (s *Storage) Find(params *FindParams) (p *Persistent, ok bool) {
-	s.mu.Lock()
-	defer s.mu.Unlock()
+	s.mu.RLock()
+	defer s.mu.RUnlock()
 
+	p, ok = s.findLocked(params)
+	if ok {
+		return p.ShallowClone(), true
+	}
+
+	return nil, false
+}
+
+// IgnoresStatistics returns true if the persistent client, found by params the
+// same way as [Storage.Find], ignores the statistics.  found is false if there
+// is no such client.  Unlike [Storage.Find], it doesn't clone the client, so
+// it's cheap enough for every DNS query.
+func (s *Storage) IgnoresStatistics(params *FindParams) (ignore, found bool) {
+	s.mu.RLock()
+	defer s.mu.RUnlock()
+
+	p, found := s.findLocked(params)
+
+	return found && p.IgnoreStatistics, found
+}
+
+// findLocked is [Storage.Find] without cloning the client.  s.mu must be
+// locked.
+func (s *Storage) findLocked(params *FindParams) (p *Persistent, ok bool) {
 	isClientID := params.ClientID != ""
 	isRemoteIP := params.RemoteIP != (netip.Addr{})
 	isSubnet := params.Subnet != (netip.Prefix{})
@@ -558,7 +583,7 @@ func (s *Storage) Find(params *FindParams) (p *Persistent, ok bool) {
 		}
 
 		if ok {
-			return p.ShallowClone(), true
+			return p, true
 		}
 	}
 }
@@ -589,12 +614,36 @@ func (s *Storage) findByIP(addr netip.Addr) (p *Persistent, ok bool) {
 //
 // TODO(s.chzhen):  Consider accepting [FindParams].
 func (s *Storage) FindLoose(ip netip.Addr, id string) (p *Persistent, ok bool) {
-	s.mu.Lock()
-	defer s.mu.Unlock()
+	s.mu.RLock()
+	defer s.mu.RUnlock()
 
+	p, ok = s.findLooseLocked(ip, id)
+	if ok {
+		return p.ShallowClone(), true
+	}
+
+	return nil, false
+}
+
+// IgnoresQueryLog returns true if the persistent client, found the same way as
+// [Storage.FindLoose], ignores the query log.  found is false if there is no
+// such client.  Unlike [Storage.FindLoose], it doesn't clone the client, so
+// it's cheap enough for every DNS query.
+func (s *Storage) IgnoresQueryLog(ip netip.Addr, id string) (ignore, found bool) {
+	s.mu.RLock()
+	defer s.mu.RUnlock()
+
+	p, found := s.findLooseLocked(ip, id)
+
+	return found && p.IgnoreQueryLog, found
+}
+
+// findLooseLocked is [Storage.FindLoose] without cloning the client.  s.mu
+// must be locked.
+func (s *Storage) findLooseLocked(ip netip.Addr, id string) (p *Persistent, ok bool) {
 	p, ok = s.index.find(id)
 	if ok {
-		return p.ShallowClone(), ok
+		return p, true
 	}
 
 	foundMAC := s.dhcp.MACByIP(ip)
@@ -603,11 +652,8 @@ func (s *Storage) FindLoose(ip netip.Addr, id string) (p *Persistent, ok bool) {
 	}
 
 	p = s.index.findByIPWithoutZone(ip)
-	if p != nil {
-		return p.ShallowClone(), true
-	}
 
-	return nil, false
+	return p, p != nil
 }
 
 // RemoveByName removes persistent client information.  ok is false if no such
@@ -735,19 +781,45 @@ func (s *Storage) CustomUpstreamConfig(
 	id string,
 	addr netip.Addr,
 ) (prxConf *proxy.CustomUpstreamConfig) {
+	// Most queries are from clients without a persistent client or with an
+	// up-to-date configuration, so first look it up for reading only.
+	found, upToDate := func() (found, upToDate bool) {
+		s.mu.RLock()
+		defer s.mu.RUnlock()
+
+		c, ok := s.findForUpstreams(id, addr)
+		if !ok {
+			return false, false
+		}
+
+		prxConf, upToDate = s.upstreamManager.currentCustomUpstreamConfig(c.UID)
+
+		return true, upToDate
+	}()
+	if !found || upToDate {
+		return prxConf
+	}
+
 	s.mu.Lock()
 	defer s.mu.Unlock()
 
-	c, ok := s.index.findByClientID(ClientID(id))
-	if !ok {
-		c, ok = s.findByIP(addr)
-	}
-
+	c, ok := s.findForUpstreams(id, addr)
 	if !ok {
 		return nil
 	}
 
 	return s.upstreamManager.customUpstreamConfig(c.UID, c.Name)
+}
+
+// findForUpstreams returns the persistent client for the custom upstream
+// configuration.  s.mu must be locked.
+func (s *Storage) findForUpstreams(id string, addr netip.Addr) (c *Persistent, ok bool) {
+	c, ok = s.index.findByClientID(ClientID(id))
+	if !ok {
+		c, ok = s.findByIP(addr)
+	}
+
+	return c, ok
 }
 
 // UpdateCommonUpstreamConfig implements the [dnsforward.ClientsContainer]
@@ -772,6 +844,9 @@ func (s *Storage) ClearUpstreamCache() {
 // ClientID or client IP address, and applies it to the filtering settings.
 // setts must not be nil.
 func (s *Storage) ApplyClientFiltering(id string, addr netip.Addr, setts *filtering.Settings) {
+	s.mu.RLock()
+	defer s.mu.RUnlock()
+
 	c, ok := s.index.findByClientID(ClientID(id))
 	if !ok {
 		c, ok = s.index.findByIP(addr)
