@@ -23,6 +23,12 @@ import (
 // [searchIndex].
 const indexBlockSize = 256
 
+// indexMaxEntries is the maximum number of domains, clients, or pairs of them
+// in the dictionaries of the index.  It bounds the memory that clients can make
+// the index use by sending queries with unique names.  The blocks with the
+// records that don't fit are always searched.  It's a variable for tests.
+var indexMaxEntries = 1 << 18
+
 // errIndexMismatch is returned when a [searchIndex] doesn't match the files.
 const errIndexMismatch errors.Error = "search index doesn't match the files"
 
@@ -187,11 +193,26 @@ func (d *stringDict) id(s string) (id uint32) {
 		d.ids = map[string]uint32{}
 	}
 
+	// Clone s before using it as the key as well, since it's usually a part of
+	// a whole log line.
+	s = strings.Clone(s)
 	id = uint32(len(d.strs))
 	d.ids[s] = id
-	d.strs = append(d.strs, strings.Clone(s))
+	d.strs = append(d.strs, s)
 
 	return id
+}
+
+// tryID is like [stringDict.id], but it doesn't add s if d already has
+// [indexMaxEntries] strings.
+func (d *stringDict) tryID(s string) (id uint32, ok bool) {
+	if id, ok = d.ids[s]; ok {
+		return id, true
+	} else if len(d.strs) >= indexMaxEntries {
+		return 0, false
+	}
+
+	return d.id(s), true
 }
 
 // clientPair is a combination of a ClientID and an IP address, as their IDs in
@@ -226,6 +247,18 @@ func (d *pairDict) id(p clientPair) (id uint32) {
 	d.pairs = append(d.pairs, p)
 
 	return id
+}
+
+// tryID is like [pairDict.id], but it doesn't add p if d already has
+// [indexMaxEntries] pairs.
+func (d *pairDict) tryID(p clientPair) (id uint32, ok bool) {
+	if id, ok = d.ids[p]; ok {
+		return id, true
+	} else if len(d.pairs) >= indexMaxEntries {
+		return 0, false
+	}
+
+	return d.id(p), true
 }
 
 // recordMeta is the data of a query log record that the index keeps.
@@ -310,17 +343,38 @@ func (idx *searchIndex) addRecord(fi *fileIndex, m *recordMeta, end int64) {
 	}
 
 	blk.results |= resultBit(m.reason, m.isFiltered)
-	b.domains[idx.domains.id(m.host)] = struct{}{}
-	b.pairs[idx.pairs.id(clientPair{
-		clientID: idx.clients.id(m.clientID),
-		ip:       idx.clients.id(m.ip),
-	})] = struct{}{}
+	if !idx.addNames(b, m) {
+		// The block can't be described, so it must always be searched.
+		blk.unknown = true
+	}
 
 	b.count++
 	if b.count == indexBlockSize {
 		fi.blocks = append(fi.blocks, b.build())
 		fi.open = nil
 	}
+}
+
+// addNames adds the IDs of the domain and the client of m to b.  It returns
+// false if a dictionary is full, see [indexMaxEntries].
+func (idx *searchIndex) addNames(b *blockBuilder, m *recordMeta) (ok bool) {
+	domainID, domainOK := idx.domains.tryID(m.host)
+	if domainOK {
+		b.domains[domainID] = struct{}{}
+	}
+
+	clientID, clientOK := idx.clients.tryID(m.clientID)
+	ipID, ipOK := idx.clients.tryID(m.ip)
+	if !clientOK || !ipOK {
+		return false
+	}
+
+	pairID, pairOK := idx.pairs.tryID(clientPair{clientID: clientID, ip: ipID})
+	if pairOK {
+		b.pairs[pairID] = struct{}{}
+	}
+
+	return domainOK && pairOK
 }
 
 // addLines adds the complete lines from data, which starts at offset start of
@@ -394,7 +448,12 @@ func (idx *searchIndex) build(ctx context.Context, l *slog.Logger, paths [2]stri
 			return
 		}
 
-		if idx.install(built, gen, paths, writeMu) {
+		ok, err := idx.install(built, gen, paths, writeMu)
+		if err != nil {
+			l.ErrorContext(ctx, "installing search index", slogutil.KeyError, err)
+
+			return
+		} else if ok {
 			l.DebugContext(
 				ctx,
 				"built search index",
@@ -423,8 +482,13 @@ func (idx *searchIndex) indexFiles(paths [2]string) (err error) {
 
 // install replaces the contents of idx with built if the files haven't been
 // rotated or removed since the generation gen.  It indexes the records written
-// to the current file in the meantime.
-func (idx *searchIndex) install(built *searchIndex, gen uint64, paths [2]string, writeMu *sync.Mutex) (ok bool) {
+// to the current file in the meantime.  ok is false if the files have changed.
+func (idx *searchIndex) install(
+	built *searchIndex,
+	gen uint64,
+	paths [2]string,
+	writeMu *sync.Mutex,
+) (ok bool, err error) {
 	writeMu.Lock()
 	defer writeMu.Unlock()
 
@@ -432,19 +496,19 @@ func (idx *searchIndex) install(built *searchIndex, gen uint64, paths [2]string,
 	defer idx.mu.Unlock()
 
 	if idx.gen != gen {
-		return false
+		return false, nil
 	}
 
-	err := built.indexFile(&built.files[currentFileIdx], paths[currentFileIdx])
+	err = built.indexFile(&built.files[currentFileIdx], paths[currentFileIdx])
 	if err != nil {
-		return false
+		return false, fmt.Errorf("indexing %q: %w", paths[currentFileIdx], err)
 	}
 
 	idx.domains, idx.clients, idx.pairs = built.domains, built.clients, built.pairs
 	idx.files = built.files
 	idx.ready = true
 
-	return true
+	return true, nil
 }
 
 // appendCurrent indexes data, which has been written to the current file at

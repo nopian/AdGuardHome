@@ -56,6 +56,8 @@ NOTE: Add new changes BELOW THIS COMMENT.
 
 ### Fixed
 
+- The query log search index keeping a whole log line in memory for every unique domain and client, which let clients make AdGuard Home use a lot of memory by sending queries for unique names.  The index now also keeps at most about 260,000 domains, clients, and pairs of them, and searches the records that don't fit without the index.
+
 - A data race between applying a persistent client's filtering settings to a query and editing the persistent clients.
 
 - A data race when setting custom filtering rules using `POST /control/filtering/set_rules`.

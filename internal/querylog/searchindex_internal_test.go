@@ -5,6 +5,7 @@ import (
 	"math/rand/v2"
 	"net"
 	"os"
+	"runtime"
 	"strings"
 	"testing"
 	"time"
@@ -318,6 +319,85 @@ func TestSearchIndex_lifecycle(t *testing.T) {
 
 		check(t)
 	})
+}
+
+func TestSearchIndex_addRecord_memory(t *testing.T) {
+	const (
+		domainsNum = 1_000
+		padLen     = 128 << 10
+
+		// maxLive is far below the domainsNum*padLen bytes that the index would
+		// keep if it kept the lines.
+		maxLive = 32 << 20
+	)
+
+	pad := strings.Repeat("A", padLen)
+	idx := &searchIndex{}
+	fi := &fileIndex{}
+
+	var before, after runtime.MemStats
+	runtime.GC()
+	runtime.ReadMemStats(&before)
+
+	var end int64
+	for i := range domainsNum {
+		line := fmt.Sprintf(`{"IP":"192.0.2.1","QH":"u%d.example","Result":{},"Answer":%q}`, i, pad)
+		m := readRecordMeta(line)
+		end += int64(len(line) + 1)
+		idx.addRecord(fi, &m, end)
+	}
+
+	runtime.GC()
+	runtime.ReadMemStats(&after)
+
+	require.Len(t, idx.domains.strs, domainsNum)
+	assert.Less(t, int64(after.HeapAlloc)-int64(before.HeapAlloc), int64(maxLive))
+	runtime.KeepAlive(idx)
+}
+
+func TestSearchIndex_maxEntries(t *testing.T) {
+	const maxEntries = 10
+
+	prev := indexMaxEntries
+	indexMaxEntries = maxEntries
+	t.Cleanup(func() { indexMaxEntries = prev })
+
+	r := rand.New(rand.NewPCG(11, 12))
+	l := newIndexTestLog(t)
+
+	// Many records are for unique domains, so the dictionary fills up.
+	addIndexTestRecords(t, l, r, 3_000)
+	require.NoError(t, l.rotate(testutil.ContextWithTimeout(t, testTimeout)))
+	addIndexTestRecords(t, l, r, 2_000)
+
+	buildIndex(t, l)
+	addIndexTestRecords(t, l, r, 500)
+
+	func() {
+		l.index.mu.RLock()
+		defer l.index.mu.RUnlock()
+
+		assert.LessOrEqual(t, len(l.index.domains.strs), maxEntries)
+		assert.LessOrEqual(t, len(l.index.clients.strs), maxEntries)
+		assert.LessOrEqual(t, len(l.index.pairs.pairs), maxEntries)
+
+		unknown := 0
+		for _, fi := range l.index.files {
+			for _, blk := range fi.blocks {
+				if blk.unknown {
+					unknown++
+				}
+			}
+		}
+
+		assert.Positive(t, unknown)
+	}()
+
+	all, _ := l.search(testutil.ContextWithTimeout(t, testTimeout), &searchParams{limit: 100_000})
+	for i := range 100 {
+		p := randomSearchParams(r, all)
+		searchBoth(t, l, p, fmt.Sprintf("iteration %d, params %+v", i, p))
+	}
 }
 
 func TestQuickResult(t *testing.T) {
