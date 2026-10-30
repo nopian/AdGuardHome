@@ -92,6 +92,34 @@ The real-server numbers come from running the built binaries with both HaGeZi li
 
 ## Phase 2: hash-based fast path for list matching
 
+### Phase 2 results
+
+Same machine as the baseline, 2.1M-rule HaGeZi lists unless noted.
+
+| What | Before | After |
+|---|---|---|
+| Rule matching per query, allowed domain | 9.5 µs | 1.6 µs |
+| Rule matching per query, blocked domain | 14 µs | 2.4 µs |
+| Rule matching per query, 20k generated rules, allowed / blocked | 1.8 / 3.4 µs | 0.6 / 1.3 µs |
+| Compiling the blocklists | 4.7 s | 0.57 s |
+| Heap used by the compiled blocklists | about 220 MB | 38 MB |
+| Matching 40 blocked services | about 16 µs | 0.3 µs on a match, 1.7 µs otherwise |
+| Whole server, plain DNS over UDP | 15.1 µs per query | 11.5 µs per query |
+
+The remaining matching time is mostly memory latency: the table is 36 MB, so a lookup usually misses the CPU caches.  Saving the compiled table to disk turned out unnecessary, since compiling takes half a second.
+
+How it works:
+
+- When a list is compiled, rules of the forms `||d^`, `@@||d^`, `||d^$important`, and `@@||d^$important` go into a hash table grouped into small buckets, about 17 bytes per rule.  All other rules, including hosts-file rules, go into a much smaller urlfilter engine.
+- A request checks the table for each domain that `||d^` can match according to the regular expression urlfilter builds for it, including its handling of characters such as `+` and `_` in hostnames.  Matched rules from both parts go through urlfilter's `GetDNSBasicRule`.
+- urlfilter ignores later copies of rules it can't index by shortcut, such as `||a.io^`, so the table does the same.
+
+Checks:
+
+- `TestDNSFilter_customRules_differential` compares against a plain urlfilter engine on random rule sets with near-miss rule shapes, short domains, unusual hostnames, list IDs out of order, and custom `$badfilter` rules.  A one-off heavy run made 624,000 comparisons without a difference.
+- `TestForEachRuleDomain_urlfilter` compares the candidate domains with urlfilter's own matching for random hostnames.
+- `TestListsEngine_realLists`, with `AGH_BENCH_LISTS` set, compares both engines on real lists: the HaGeZi lists, the AdGuard DNS filter, and the StevenBlack hosts file.
+
 - Sort rules into two groups when a list loads.  Plain `||domain^` rules, `@@` and `$important` variants, and `0.0.0.0 host` lines go into compact hash tables.  Everything else (regex, `$client`, `$dnsrewrite`, `$denyallow`, and so on) goes into a small leftover urlfilter engine.
 - A lookup checks the hash tables for each domain level of the hostname.  Only on a hit is the matched rule parsed and passed to the same urlfilter selection function as in Phase 1.  Queries that match nothing never parse anything.
 - Compile each list once after download and save the result to disk, so startup just loads the compiled copy.  Updating one list rebuilds only the list tables, in the background.

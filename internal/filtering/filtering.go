@@ -4,14 +4,12 @@ package filtering
 import (
 	"context"
 	"fmt"
-	"io/fs"
 	"log/slog"
 	"net"
 	"net/http"
 	"net/netip"
 	"os"
 	"path/filepath"
-	"runtime"
 	"runtime/debug"
 	"slices"
 	"strings"
@@ -30,7 +28,6 @@ import (
 	"github.com/AdguardTeam/golibs/mathutil"
 	"github.com/AdguardTeam/golibs/syncutil"
 	"github.com/AdguardTeam/urlfilter"
-	"github.com/AdguardTeam/urlfilter/filterlist"
 	"github.com/AdguardTeam/urlfilter/rules"
 	"github.com/c2h5oh/datasize"
 	"github.com/miekg/dns"
@@ -265,11 +262,13 @@ type DNSFilter struct {
 	// bufPool is a pool of buffers used for filtering-rule list parsing.
 	bufPool *syncutil.Pool[[]byte]
 
-	rulesStorage    *filterlist.RuleStorage
-	filteringEngine *urlfilter.DNSEngine
+	// filteringEngine matches the blocklists.  It also contains the custom
+	// rules when customRules is nil.  It is protected by engineLock.
+	filteringEngine *listsEngine
 
-	rulesStorageAllow    *filterlist.RuleStorage
-	filteringEngineAllow *urlfilter.DNSEngine
+	// filteringEngineAllow matches the allowlists.  It is protected by
+	// engineLock.
+	filteringEngineAllow *listsEngine
 
 	// customRules are the compiled custom filtering rules.  It is nil when the
 	// custom rules are compiled into filteringEngine, which happens when they
@@ -426,15 +425,13 @@ func (d *DNSFilter) Close() {
 }
 
 func (d *DNSFilter) reset(ctx context.Context) {
-	if d.rulesStorage != nil {
-		if err := d.rulesStorage.Close(); err != nil {
-			d.logger.ErrorContext(ctx, "closing rules storage", slogutil.KeyError, err)
+	for _, e := range []*listsEngine{d.filteringEngine, d.filteringEngineAllow} {
+		if e == nil {
+			continue
 		}
-	}
 
-	if d.rulesStorageAllow != nil {
-		if err := d.rulesStorageAllow.Close(); err != nil {
-			d.logger.ErrorContext(ctx, "closing allow rules storage", slogutil.KeyError, err)
+		if err := e.Close(); err != nil {
+			d.logger.ErrorContext(ctx, "closing filtering engine", slogutil.KeyError, err)
 		}
 	}
 }
@@ -657,112 +654,50 @@ func (d *DNSFilter) matchBlockedServicesRules(
 		return Result{}, nil
 	}
 
-	req := rules.NewRequestForHostname(host)
-	for _, s := range svcs {
-		for _, rule := range s.Rules {
-			if rule.Match(req) {
-				res.Reason = FilteredBlockedService
-				res.IsFiltered = true
-				res.ServiceName = s.Name
+	var domainRules []serviceRuleRef
+	forEachRuleDomain(host, func(domain string) {
+		domainRules = append(domainRules, serviceDomainRules[domain]...)
+	})
 
-				ruleText := rule.Text()
-				res.Rules = []*ResultRule{{
-					// #nosec G115 -- The overflow is required for backwards
-					// compatibility.
-					FilterListID: rulelist.APIID(rule.GetFilterListID()),
-					Text:         ruleText,
-				}}
-
-				d.logger.DebugContext(
-					context.TODO(),
-					"blocked services matched rule",
-					"rule", ruleText,
-					"host", host,
-					"service", s.Name,
-				)
-
-				return res, nil
-			}
+	var req *rules.Request
+	getReq := func() (r *rules.Request) {
+		if req == nil {
+			req = rules.NewRequestForHostname(host)
 		}
+
+		return req
 	}
 
-	return res, nil
-}
-
-//
-// Adding rule and matching against the rules
-//
-
-func newRuleStorage(filters []Filter) (rs *filterlist.RuleStorage, err error) {
-	lists := make([]filterlist.Interface, 0, len(filters))
-	for _, f := range filters {
-		var rl filterlist.Interface
-		var skip bool
-		rl, skip, err = ruleListFromFilter(f)
-		if skip {
+	for _, s := range svcs {
+		rule := firstMatchingServiceRule(s, domainRules, getReq)
+		if rule == nil {
 			continue
 		}
 
-		if err != nil {
-			// Don't wrap the error, because it's informative enough as is.
-			return nil, err
-		}
+		res.Reason = FilteredBlockedService
+		res.IsFiltered = true
+		res.ServiceName = s.Name
 
-		lists = append(lists, rl)
+		ruleText := rule.Text()
+		res.Rules = []*ResultRule{{
+			// #nosec G115 -- The overflow is required for backwards
+			// compatibility.
+			FilterListID: rulelist.APIID(rule.GetFilterListID()),
+			Text:         ruleText,
+		}}
+
+		d.logger.DebugContext(
+			context.TODO(),
+			"blocked services matched rule",
+			"rule", ruleText,
+			"host", host,
+			"service", s.Name,
+		)
+
+		return res, nil
 	}
 
-	rs, err = filterlist.NewRuleStorage(lists)
-	if err != nil {
-		return nil, fmt.Errorf("creating rule storage: %w", err)
-	}
-
-	return rs, nil
-}
-
-// ruleListFromFilter returns a rule list from a Filter.
-func ruleListFromFilter(f Filter) (rl filterlist.Interface, skip bool, err error) {
-	if len(f.Data) != 0 {
-		return filterlist.NewBytes(&filterlist.BytesConfig{
-			ID:             f.ID,
-			RulesText:      f.Data,
-			IgnoreCosmetic: true,
-		}), false, nil
-	}
-
-	if f.FilePath == "" {
-		return nil, true, nil
-	}
-
-	if runtime.GOOS == "windows" {
-		// On Windows we don't pass a file to urlfilter because it's
-		// difficult to update this file while it's being used.
-		var data []byte
-		data, err = os.ReadFile(f.FilePath)
-		if errors.Is(err, fs.ErrNotExist) {
-			return nil, true, nil
-		} else if err != nil {
-			return nil, false, fmt.Errorf("reading filter content: %w", err)
-		}
-
-		return filterlist.NewBytes(&filterlist.BytesConfig{
-			ID:             f.ID,
-			RulesText:      data,
-			IgnoreCosmetic: true,
-		}), false, nil
-	}
-
-	rl, err = filterlist.NewFile(&filterlist.FileConfig{
-		ID:             f.ID,
-		Path:           f.FilePath,
-		IgnoreCosmetic: true,
-	})
-	if errors.Is(err, fs.ErrNotExist) {
-		return nil, true, nil
-	} else if err != nil {
-		return nil, false, fmt.Errorf("creating file rule list with %q: %w", f.FilePath, err)
-	}
-
-	return rl, false, nil
+	return res, nil
 }
 
 // initFiltering compiles the filters and installs the resulting engines.
@@ -786,23 +721,20 @@ func (d *DNSFilter) initFiltering(
 	}
 
 	e := &engines{}
-	e.blockStorage, err = newRuleStorage(listFilters)
+	e.block, err = newListsEngine(listFilters, true)
 	if err != nil {
 		cr.close(ctx, d.logger)
 
-		return err
+		return fmt.Errorf("compiling blocklists: %w", err)
 	}
 
-	e.allowStorage, err = newRuleStorage(allowFilters)
+	e.allow, err = newListsEngine(allowFilters, true)
 	if err != nil {
 		cr.close(ctx, d.logger)
-		_ = e.blockStorage.Close()
+		e.close(ctx, d.logger)
 
-		return err
+		return fmt.Errorf("compiling allowlists: %w", err)
 	}
-
-	e.block = urlfilter.NewDNSEngine(e.blockStorage)
-	e.allow = urlfilter.NewDNSEngine(e.allowStorage)
 
 	err = d.installEngines(ctx, e, cr, customGen)
 	if err != nil {
@@ -1033,7 +965,7 @@ func (d *DNSFilter) matchRules(req *urlfilter.DNSRequest) (res *urlfilter.DNSRes
 
 	res, matched = d.filteringEngine.MatchRequest(req)
 	if len(res.NetworkRules) > 1 {
-		sortNetworkRules(res.NetworkRules)
+		res.NetworkRules = normalizeNetworkRules(res.NetworkRules)
 		if res.NetworkRule != nil {
 			res.NetworkRule = rules.GetDNSBasicRule(res.NetworkRules)
 		}

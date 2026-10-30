@@ -30,7 +30,11 @@ NOTE: Add new changes BELOW THIS COMMENT.
 
 - Custom filtering rules are now compiled separately from the blocklists, so changing them, for example by unblocking a domain from the query log, takes effect in milliseconds instead of after recompiling all blocklists.  Custom rules containing `$badfilter` rules are still compiled together with the blocklists.
 
-- When several matching rules have the same priority, the custom rule is now reported, and otherwise the one from the blocklist with the lowest ID.  The same order is used to resolve conflicting `$dnsrewrite` rules.  Previously, the choice depended on the internal order of the filtering engine, which could change whenever any rule was edited.
+- When several matching rules have the same priority, the custom rule is now reported, and otherwise the one from the blocklist with the lowest ID.  The same order is used to resolve conflicting `$dnsrewrite` rules.  Previously, the choice depended on the internal order of the filtering engine, which could change whenever any rule was edited.  A rule that matches a request is also no longer applied twice, which could duplicate `$dnsrewrite` answers for some hostnames.
+
+- Plain domain rules, such as `||example.org^` and `@@||example.org^$important`, which make up most blocklists, are now kept in a compact hash table instead of the general rule index.  With 2.1 million such rules, matching is about 5 times faster, compiling the blocklists is about 8 times faster, and the filtering engine uses about 38 MB of memory instead of about 220 MB.  Blocklists are now read into memory instead of from disk when a rule matches.
+
+- Blocked services are now matched using an index of their domains instead of checking every rule of every blocked service for every request.
 
 - The default value of `filtering.blocked_response_ttl` is now 1 second instead of 10, so that clients don't keep using a cached blocked response long after the domain has been unblocked.  Existing configurations are not changed.
 
