@@ -356,9 +356,80 @@ func (d *DNSFilter) handleFilteringSetRules(w http.ResponseWriter, r *http.Reque
 		return
 	}
 
-	d.conf.UserRules = req.Rules
+	// Apply the rules before writing the configuration file so that they take
+	// effect as soon as possible.
+	d.SetUserRules(ctx, req.Rules)
 	d.conf.ConfModifier.Apply(ctx)
-	d.EnableFilters(true)
+}
+
+// filteringEditRulesReq is the request for the POST
+// /control/filtering/edit_rules HTTP API.
+type filteringEditRulesReq struct {
+	// Add are the rules to append to the custom filtering rules unless already
+	// present.
+	Add []string `json:"add"`
+
+	// Remove are the rules to remove from the custom filtering rules.
+	Remove []string `json:"remove"`
+}
+
+// filteringEditRulesResp is the response for the POST
+// /control/filtering/edit_rules HTTP API.
+type filteringEditRulesResp struct {
+	// Rules are the resulting custom filtering rules.
+	Rules []string `json:"rules"`
+}
+
+// validateEditedRules trims the surrounding spaces of each rule in place and
+// returns an error if any rule is empty or contains a line break.
+func validateEditedRules(rules []string) (err error) {
+	for i, r := range rules {
+		r = strings.TrimSpace(r)
+		if r == "" {
+			return fmt.Errorf("rule at index %d: %w", i, errors.ErrEmptyValue)
+		} else if strings.ContainsAny(r, "\r\n") {
+			return fmt.Errorf("rule at index %d: must not contain line breaks", i)
+		}
+
+		rules[i] = r
+	}
+
+	return nil
+}
+
+// handleFilteringEditRules is the handler for the POST
+// /control/filtering/edit_rules HTTP API.  Unlike POST
+// /control/filtering/set_rules, it changes only the given rules, so concurrent
+// edits don't overwrite each other.
+func (d *DNSFilter) handleFilteringEditRules(w http.ResponseWriter, r *http.Request) {
+	ctx := r.Context()
+	l := d.logger
+
+	req := &filteringEditRulesReq{}
+	err := json.NewDecoder(r.Body).Decode(req)
+	if err != nil {
+		aghhttp.ErrorAndLog(ctx, l, r, w, http.StatusBadRequest, "reading req: %s", err)
+
+		return
+	}
+
+	err = errors.Join(validateEditedRules(req.Add), validateEditedRules(req.Remove))
+	if err != nil {
+		aghhttp.ErrorAndLog(ctx, l, r, w, http.StatusBadRequest, "validating req: %s", err)
+
+		return
+	}
+
+	// Apply the rules before writing the configuration file so that they take
+	// effect as soon as possible.
+	rules, changed := d.EditUserRules(ctx, req.Add, req.Remove)
+	if changed {
+		d.conf.ConfModifier.Apply(ctx)
+	}
+
+	aghhttp.WriteJSONResponseOK(ctx, l, w, r, &filteringEditRulesResp{
+		Rules: rules,
+	})
 }
 
 func (d *DNSFilter) handleFilteringRefresh(w http.ResponseWriter, r *http.Request) {
@@ -755,6 +826,7 @@ func (d *DNSFilter) RegisterFilteringHandlers() {
 	registerHTTP(http.MethodPost, "/control/filtering/set_url", d.handleFilteringSetURL)
 	registerHTTP(http.MethodPost, "/control/filtering/refresh", d.handleFilteringRefresh)
 	registerHTTP(http.MethodPost, "/control/filtering/set_rules", d.handleFilteringSetRules)
+	registerHTTP(http.MethodPost, "/control/filtering/edit_rules", d.handleFilteringEditRules)
 	registerHTTP(http.MethodGet, "/control/filtering/check_host", d.handleCheckHost)
 }
 

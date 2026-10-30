@@ -24,6 +24,7 @@ import (
 	"time"
 
 	"github.com/AdguardTeam/AdGuardHome/internal/agh"
+	"github.com/AdguardTeam/AdGuardHome/internal/aghhttp"
 	"github.com/AdguardTeam/AdGuardHome/internal/aghnet"
 	"github.com/AdguardTeam/AdGuardHome/internal/aghos"
 	"github.com/AdguardTeam/AdGuardHome/internal/aghtest"
@@ -32,7 +33,9 @@ import (
 	"github.com/AdguardTeam/AdGuardHome/internal/filtering"
 	"github.com/AdguardTeam/AdGuardHome/internal/filtering/hashprefix"
 	"github.com/AdguardTeam/AdGuardHome/internal/filtering/safesearch"
+	"github.com/AdguardTeam/AdGuardHome/internal/querylog"
 	"github.com/AdguardTeam/AdGuardHome/internal/schedule"
+	"github.com/AdguardTeam/AdGuardHome/internal/stats"
 	"github.com/AdguardTeam/dnsproxy/dnsproxytest"
 	"github.com/AdguardTeam/dnsproxy/proxy"
 	"github.com/AdguardTeam/dnsproxy/upstream"
@@ -40,6 +43,7 @@ import (
 	"github.com/AdguardTeam/golibs/netutil"
 	"github.com/AdguardTeam/golibs/testutil"
 	"github.com/AdguardTeam/golibs/timeutil"
+	"github.com/AdguardTeam/urlfilter/rules"
 	"github.com/miekg/dns"
 	"github.com/stretchr/testify/assert"
 	"github.com/stretchr/testify/require"
@@ -1958,4 +1962,148 @@ func sendDNSRequests(
 
 		assertGoogleAResponse(tb, reply)
 	}
+}
+
+// newBenchServer returns a started server that filters with the benchmark
+// blocklists and records the queries in the query log and the statistics, as
+// well as some of the domains blocked by the blocklists.
+func newBenchServer(b *testing.B) (s *Server, blocked []string) {
+	b.Helper()
+
+	filtering.InitModule(b.Context(), testLogger)
+
+	paths, blocked := aghtest.BenchBlocklists(b, 20_000*aghtest.BenchScale(b), 1_000)
+	filters := []filtering.Filter{{
+		ID:   0,
+		Data: []byte("||custom.example^\n"),
+	}}
+	for i, p := range paths {
+		filters = append(filters, filtering.Filter{
+			ID:       rules.ListID(i + 1),
+			FilePath: p,
+		})
+	}
+
+	f, err := filtering.New(&filtering.Config{
+		Logger:               testLogger,
+		BlockingMode:         filtering.BlockingModeDefault,
+		BlockedServices:      emptyFilteringBlockedServices(),
+		ApplyClientFiltering: applyEmptyClientFiltering,
+	}, filters)
+	require.NoError(b, err)
+
+	f.SetEnabled(true)
+
+	dir := b.TempDir()
+	ignored, err := aghnet.NewIgnoreEngine(nil, false)
+	require.NoError(b, err)
+
+	ql, err := querylog.New(querylog.Config{
+		Logger:         testLogger,
+		Ignored:        ignored,
+		Anonymizer:     aghnet.NewIPMut(nil),
+		ConfigModifier: agh.EmptyConfigModifier{},
+		HTTPReg:        aghhttp.EmptyRegistrar{},
+		FindClient:     func(_ []string) (c *querylog.Client, err error) { return nil, nil },
+		BaseDir:        dir,
+		RotationIvl:    timeutil.Day,
+		MemSize:        1000,
+		Enabled:        true,
+		FileEnabled:    true,
+	})
+	require.NoError(b, err)
+
+	st, err := stats.New(stats.Config{
+		Logger:            testLogger,
+		ShouldCountClient: func(_ []string) (ok bool) { return true },
+		Filename:          filepath.Join(dir, "stats.db"),
+		Limit:             timeutil.Day,
+		Enabled:           true,
+		HTTPReg:           aghhttp.EmptyRegistrar{},
+		Ignored:           ignored,
+		ConfigModifier:    agh.EmptyConfigModifier{},
+	})
+	require.NoError(b, err)
+
+	st.Start()
+	testutil.CleanupAndRequireSuccess(b, st.Close)
+
+	s, err = NewServer(DNSCreateParams{
+		DHCPServer: &testDHCP{
+			OnEnabled:  func() (ok bool) { return false },
+			OnHostByIP: func(_ netip.Addr) (host string) { return "" },
+		},
+		DNSFilter:   f,
+		Stats:       st,
+		QueryLog:    ql,
+		PrivateNets: netutil.SubnetSetFunc(netutil.IsLocallyServed),
+		Logger:      testLogger,
+		TLSManager:  testTLSManager,
+		Anonymizer:  aghnet.NewIPMut(nil),
+	})
+	require.NoError(b, err)
+
+	conf := &ServerConfig{
+		UDPListenAddrs:   []*net.UDPAddr{{IP: net.IP{127, 0, 0, 1}}},
+		TLSConf:          &TLSConfig{},
+		UpstreamMode:     proxy.UpstreamModeLoadBalance,
+		EDNSClientSubnet: &EDNSClientSubnet{Enabled: false},
+		ClientsContainer: EmptyClientsContainer{},
+		ServePlainDNS:    true,
+		UpstreamConfig: &proxy.UpstreamConfig{
+			Upstreams: []upstream.Upstream{newGoogleUpstream()},
+		},
+	}
+	require.NoError(b, s.Prepare(testutil.ContextWithTimeout(b, testTimeout), conf))
+
+	s.conf.UpstreamConfig.Upstreams = []upstream.Upstream{newGoogleUpstream()}
+	startDeferStop(b, s)
+
+	return s, blocked
+}
+
+// BenchmarkServer_udp measures the throughput of the server for plain DNS
+// queries over UDP from many clients.  Every fifth query is for a blocked
+// domain.
+func BenchmarkServer_udp(b *testing.B) {
+	s, blocked := newBenchServer(b)
+	addr := s.dnsProxy.Addr(proxy.ProtoUDP).String()
+
+	hosts := make([]string, 0, len(blocked)*5)
+	for i, host := range blocked {
+		hosts = append(hosts, "sub."+host+".")
+		for j := range 4 {
+			hosts = append(hosts, fmt.Sprintf("host%d-%d.allowed.example.", i, j))
+		}
+	}
+
+	b.SetParallelism(8)
+	b.ReportAllocs()
+	b.RunParallel(func(pb *testing.PB) {
+		conn, err := dns.Dial("udp", addr)
+		if !assert.NoError(b, err) {
+			return
+		}
+
+		defer func() { assert.NoError(b, conn.Close()) }()
+
+		for i := 0; pb.Next(); i++ {
+			if !assert.NoError(b, exchangeTestMessage(conn, hosts[i%len(hosts)])) {
+				return
+			}
+		}
+	})
+}
+
+// exchangeTestMessage sends a test query for host over conn and reads the
+// response.
+func exchangeTestMessage(conn *dns.Conn, host string) (err error) {
+	err = conn.WriteMsg(createTestMessage(host))
+	if err != nil {
+		return err
+	}
+
+	_, err = conn.ReadMsg()
+
+	return err
 }

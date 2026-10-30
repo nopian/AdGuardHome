@@ -2,6 +2,14 @@
 
 <!-- TODO(a.garipov): Reformat in accordance with the KeepAChangelog spec. -->
 
+## v0.107.80: API changes
+
+### New `POST /control/filtering/edit_rules` HTTP API
+
+- The new HTTP API `POST /control/filtering/edit_rules` adds and removes individual custom filtering rules.  Unlike `POST /control/filtering/set_rules`, it doesn't require sending all rules, so concurrent edits don't overwrite each other.  See `EditRulesRequest` and `EditRulesResponse` in `openapi.yaml`.
+
+- Changes made with `POST /control/filtering/edit_rules` and `POST /control/filtering/set_rules` now take effect before the response is sent, as long as the custom rules contain no `$badfilter` rules.
+
 ## v0.107.79: API changes
 
 - Field `bootstrap_dns` in `POST /control/dns_config` now accepts comments.  A comment must start with the `#` symbol.

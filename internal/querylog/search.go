@@ -1,6 +1,7 @@
 package querylog
 
 import (
+	"cmp"
 	"context"
 	"fmt"
 	"io"
@@ -121,12 +122,13 @@ func (l *queryLog) search(
 
 	// now let's get a unified collection
 	entries = append(memoryEntries, fileEntries...)
-	if len(entries) > totalLimit {
+	isFull := len(entries) >= totalLimit
+	if isFull {
 		// remove extra records
 		entries = entries[:totalLimit]
 	}
 
-	entries, oldest = l.finalizeSearchResults(entries, params, oldest)
+	entries, oldest = l.finalizeSearchResults(entries, params, oldest, isFull)
 
 	l.logger.DebugContext(
 		ctx,
@@ -141,11 +143,16 @@ func (l *queryLog) search(
 }
 
 // finalizeSearchResults sorts entries and applies offset trimming, and updates
-// the oldest timestamp.  params must not be nil.
+// the oldest timestamp.  isFull is true if entries were cut at the limit, in
+// which case the next page must start after the last returned entry.
+// Otherwise, oldest is the time of the oldest scanned record, or zero if the
+// whole log has been scanned, so that the next page doesn't scan the same
+// records again.  params must not be nil.
 func (l *queryLog) finalizeSearchResults(
 	entries []*logEntry,
 	params *searchParams,
 	oldest time.Time,
+	isFull bool,
 ) (res []*logEntry, t time.Time) {
 	// Resort entries on start time to partially mitigate query log looking
 	// weird on the frontend.
@@ -163,8 +170,7 @@ func (l *queryLog) finalizeSearchResults(
 		}
 	}
 
-	if len(entries) > 0 {
-		// Update oldest after merging in the memory buffer.
+	if isFull && len(entries) > 0 {
 		oldest = entries[len(entries)-1].Time
 	}
 
@@ -236,7 +242,9 @@ func (l *queryLog) readEntries(
 			l.logger.ErrorContext(ctx, "reading next entry", slogutil.KeyError, rErr)
 		}
 
-		oldestNano = ts
+		// Keep the previous timestamp if the record has none, for example
+		// because it couldn't be read.
+		oldestNano = cmp.Or(ts, oldestNano)
 		total++
 
 		if ent == nil {
@@ -346,6 +354,9 @@ func (l *queryLog) readNextEntry(
 	e = &logEntry{}
 	l.decodeLogEntry(ctx, e, line)
 
+	// Set the timestamp before skipping the entry, so that the search can
+	// continue after it.
+	ts = e.Time.UnixNano()
 	if l.isIgnored(e.QHost) {
 		return nil, ts, nil
 	}
@@ -368,7 +379,6 @@ func (l *queryLog) readNextEntry(
 		return nil, ts, nil
 	}
 
-	ts = e.Time.UnixNano()
 	if !params.match(e) {
 		return nil, ts, nil
 	}

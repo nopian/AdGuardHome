@@ -1,7 +1,9 @@
 package stats
 
 import (
+	"fmt"
 	"testing"
+	"time"
 
 	"github.com/stretchr/testify/assert"
 	"github.com/stretchr/testify/require"
@@ -174,4 +176,61 @@ func TestTopUpstreamsPairs(t *testing.T) {
 			assert.Equal(t, tc.wantAvgTime, gotAvgTime)
 		})
 	}
+}
+
+// BenchmarkStatsCtx_getData measures how long the dashboard takes to load the
+// statistics for 90 days.
+func BenchmarkStatsCtx_getData(b *testing.B) {
+	const (
+		curID      = 1_000_000
+		unitsNum   = 90 * 24
+		namesNum   = 20_000
+		topPerUnit = 100
+	)
+
+	s := newTestStatsCtx(b, Config{
+		Limit:  unitsNum * time.Hour,
+		UnitID: func() (id uint32) { return curID },
+	})
+	b.Cleanup(func() { require.NoError(b, s.Close()) })
+
+	// pairs returns the top pairs of a unit with names from a fixed pool.
+	pairs := func(prefix string, unit int) (ps []countPair) {
+		for i := range topPerUnit {
+			ps = append(ps, countPair{
+				Name:  fmt.Sprintf("%s%d.example", prefix, (unit*37+i)%namesNum),
+				Count: uint64(topPerUnit - i),
+			})
+		}
+
+		return ps
+	}
+
+	tx, err := s.db.Load().Begin(true)
+	require.NoError(b, err)
+
+	for u := range unitsNum {
+		udb := &unitDB{
+			NResult:        []uint64{0, 900, 100, 0, 0, 0},
+			Domains:        pairs("d", u),
+			BlockedDomains: pairs("b", u),
+			Clients:        pairs("c", u),
+			NTotal:         1000,
+			TimeAvg:        1234,
+		}
+		require.NoError(b, s.flushUnitToDB(udb, tx, uint32(curID-unitsNum+u)))
+	}
+
+	require.NoError(b, tx.Commit())
+
+	var resp *StatsResp
+	var ok bool
+
+	b.ReportAllocs()
+	for b.Loop() {
+		resp, ok = s.getData(unitsNum)
+	}
+
+	require.True(b, ok)
+	assert.Len(b, resp.TopQueried, maxDomains)
 }

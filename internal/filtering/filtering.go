@@ -238,6 +238,9 @@ type Stats struct {
 type filtersInitializerParams struct {
 	allowFilters []Filter
 	blockFilters []Filter
+
+	// customGen is the generation of the custom rules in blockFilters.
+	customGen uint64
 }
 
 type hostChecker struct {
@@ -267,6 +270,19 @@ type DNSFilter struct {
 
 	rulesStorageAllow    *filterlist.RuleStorage
 	filteringEngineAllow *urlfilter.DNSEngine
+
+	// customRules are the compiled custom filtering rules.  It is nil when the
+	// custom rules are compiled into filteringEngine, which happens when they
+	// contain $badfilter rules.  It is protected by engineLock.
+	customRules *customRules
+
+	// installedCustomGen is the generation of the custom rules in the installed
+	// engines.  It is protected by engineLock.
+	installedCustomGen uint64
+
+	// customGen is the generation of conf.UserRules.  It is incremented each
+	// time they change and is protected by conf.filtersMu.
+	customGen uint64
 
 	safeSearch SafeSearch
 
@@ -362,12 +378,14 @@ func (d *DNSFilter) setFilters(
 	ctx context.Context,
 	blockFilters []Filter,
 	allowFilters []Filter,
+	customGen uint64,
 	async bool,
 ) (err error) {
 	if async {
 		params := filtersInitializerParams{
 			allowFilters: allowFilters,
 			blockFilters: blockFilters,
+			customGen:    customGen,
 		}
 
 		d.filtersInitializerLock.Lock()
@@ -389,7 +407,7 @@ func (d *DNSFilter) setFilters(
 		return nil
 	}
 
-	return d.initFiltering(ctx, allowFilters, blockFilters)
+	return d.initFiltering(ctx, allowFilters, blockFilters, customGen)
 }
 
 // Close - close the object
@@ -401,7 +419,10 @@ func (d *DNSFilter) Close() {
 		d.done <- struct{}{}
 	}
 
-	d.reset(context.TODO())
+	ctx := context.TODO()
+	d.reset(ctx)
+	d.customRules.close(ctx, d.logger)
+	d.customRules = nil
 }
 
 func (d *DNSFilter) reset(ctx context.Context) {
@@ -744,36 +765,58 @@ func ruleListFromFilter(f Filter) (rl filterlist.Interface, skip bool, err error
 	return rl, false, nil
 }
 
-// Initialize urlfilter objects.
-func (d *DNSFilter) initFiltering(ctx context.Context, allowFilters, blockFilters []Filter) (err error) {
-	rulesStorage, err := newRuleStorage(blockFilters)
+// initFiltering compiles the filters and installs the resulting engines.
+// blockFilters may contain the custom filtering rules of generation customGen,
+// see [rulelist.IDCustom].  Unless they contain $badfilter rules, the custom
+// rules are compiled separately from the blocklists, so that changing them
+// doesn't require recompiling the blocklists.
+//
+// It returns [errStaleCustomRules] if newer custom rules have been installed in
+// the meantime, in which case the filters must be recompiled.
+func (d *DNSFilter) initFiltering(
+	ctx context.Context,
+	allowFilters []Filter,
+	blockFilters []Filter,
+	customGen uint64,
+) (err error) {
+	cr, listFilters, err := d.compileCustomRules(ctx, blockFilters)
 	if err != nil {
+		// Don't wrap the error, because it's informative enough as is.
 		return err
 	}
 
-	rulesStorageAllow, err := newRuleStorage(allowFilters)
+	e := &engines{}
+	e.blockStorage, err = newRuleStorage(listFilters)
 	if err != nil {
+		cr.close(ctx, d.logger)
+
 		return err
 	}
 
-	filteringEngine := urlfilter.NewDNSEngine(rulesStorage)
-	filteringEngineAllow := urlfilter.NewDNSEngine(rulesStorageAllow)
+	e.allowStorage, err = newRuleStorage(allowFilters)
+	if err != nil {
+		cr.close(ctx, d.logger)
+		_ = e.blockStorage.Close()
 
-	func() {
-		d.engineLock.Lock()
-		defer d.engineLock.Unlock()
+		return err
+	}
 
-		d.reset(ctx)
-		d.rulesStorage = rulesStorage
-		d.filteringEngine = filteringEngine
-		d.rulesStorageAllow = rulesStorageAllow
-		d.filteringEngineAllow = filteringEngineAllow
-	}()
+	e.block = urlfilter.NewDNSEngine(e.blockStorage)
+	e.allow = urlfilter.NewDNSEngine(e.allowStorage)
+
+	err = d.installEngines(ctx, e, cr, customGen)
+	if err != nil {
+		cr.close(ctx, d.logger)
+		e.close(ctx, d.logger)
+
+		// Don't wrap the error, because it's informative enough as is.
+		return err
+	}
 
 	// Make sure that the OS reclaims memory as soon as possible.
 	debug.FreeOSMemory()
 
-	d.logger.DebugContext(ctx, "initialized filtering engine")
+	d.logger.DebugContext(ctx, "initialized filtering engine", "separate_custom_rules", cr != nil)
 
 	return nil
 }
@@ -921,7 +964,7 @@ func (d *DNSFilter) matchHost(
 		return Result{}, nil
 	}
 
-	dnsres, matchedEngine := d.filteringEngine.MatchRequest(ufReq)
+	dnsres, matchedEngine := d.matchRules(ufReq)
 
 	// Check DNS rewrites first, because the API there is a bit awkward.
 	dnsRWRes := d.processDNSResultRewrites(dnsres, host)
@@ -948,6 +991,55 @@ func (d *DNSFilter) matchHost(
 	}
 
 	return res, nil
+}
+
+// compileCustomRules compiles the custom filtering rules from blockFilters
+// separately, see [splitCustomFilter], and returns them with the remaining
+// filters.  If the custom rules contain $badfilter rules, which can disable the
+// rules from the blocklists, cr is nil and listFilters are blockFilters, so that
+// they are compiled together.
+func (d *DNSFilter) compileCustomRules(
+	ctx context.Context,
+	blockFilters []Filter,
+) (cr *customRules, listFilters []Filter, err error) {
+	listFilters, custom := splitCustomFilter(blockFilters)
+
+	var data []byte
+	if custom != nil {
+		data = custom.Data
+	}
+
+	cr, err = newCustomRules(data)
+	if err != nil {
+		return nil, nil, fmt.Errorf("compiling custom rules: %w", err)
+	}
+
+	if cr.hasBadfilter {
+		cr.close(ctx, d.logger)
+
+		return nil, blockFilters, nil
+	}
+
+	return cr, listFilters, nil
+}
+
+// matchRules matches req against the custom rules and the blocklists.
+// d.engineLock must be locked for reading, and d.filteringEngine must not be
+// nil.
+func (d *DNSFilter) matchRules(req *urlfilter.DNSRequest) (res *urlfilter.DNSResult, matched bool) {
+	if !d.customRules.isEmpty() {
+		return d.customRules.matchWithLists(d.filteringEngine, req)
+	}
+
+	res, matched = d.filteringEngine.MatchRequest(req)
+	if len(res.NetworkRules) > 1 {
+		sortNetworkRules(res.NetworkRules)
+		if res.NetworkRule != nil {
+			res.NetworkRule = rules.GetDNSBasicRule(res.NetworkRules)
+		}
+	}
+
+	return res, matched
 }
 
 // makeResult returns a properly constructed Result.
@@ -1032,7 +1124,7 @@ func New(c *Config, blockFilters []Filter) (d *DNSFilter, err error) {
 	}
 
 	if blockFilters != nil {
-		err = d.initFiltering(ctx, nil, blockFilters)
+		err = d.initFiltering(ctx, nil, blockFilters, 0)
 		if err != nil {
 			d.Close()
 
@@ -1095,11 +1187,12 @@ func (d *DNSFilter) updatesLoop(ctx context.Context) {
 	for {
 		select {
 		case params := <-d.filtersInitializerChan:
-			err := d.initFiltering(ctx, params.allowFilters, params.blockFilters)
-			if err != nil {
+			err := d.initFiltering(ctx, params.allowFilters, params.blockFilters, params.customGen)
+			if errors.Is(err, errStaleCustomRules) {
+				d.logger.DebugContext(ctx, "recompiling filters", slogutil.KeyError, err)
+				d.EnableFilters(true)
+			} else if err != nil {
 				d.logger.ErrorContext(ctx, "initializing", slogutil.KeyError, err)
-
-				continue
 			}
 		case <-t.C:
 			ivl = d.periodicallyRefreshFilters(ivl)

@@ -3,6 +3,7 @@ import { untrack } from 'solid-js';
 import {
     filteringStatus,
     filteringSetRules,
+    filteringEditRules,
     filteringAddURL,
     filteringRemoveURL,
     filteringSetURL,
@@ -102,101 +103,113 @@ export const setRules = async (rules: string): Promise<boolean> => {
 
 const splitByNewLine = (str: string): string[] => str.split('\n').filter(Boolean);
 
-export const blockDomain = async (domain: string): Promise<boolean> => {
-    const previousRules = state.userRules || '';
-    const rule = `||${domain}^$important`;
-    const currentRules = splitByNewLine(previousRules);
+/**
+ * Applies the same edit as the edit_rules API to the rules text, so that the
+ * result can be shown before the server responds.  Rules are compared with the
+ * surrounding spaces trimmed.
+ */
+export const applyRulesEdit = (rules: string, add: string[], remove: string[]): string => {
+    const toRemove = new Set(remove);
+    const lines = rules.split('\n').filter((line) => !toRemove.has(line.trim()));
 
-    if (currentRules.includes(rule)) {
+    add.forEach((rule) => {
+        if (lines.some((line) => line.trim() === rule)) {
+            return;
+        }
+
+        while (lines.length > 0 && lines[lines.length - 1].trim() === '') {
+            lines.pop();
+        }
+
+        lines.push(rule);
+    });
+
+    return lines.join('\n');
+};
+
+let editRulesSeq = 0;
+
+/**
+ * Adds and removes individual custom filtering rules.  Unlike setRules, it
+ * doesn't send the other rules, so it can't overwrite changes made elsewhere.
+ * The rules are updated locally right away and restored if the request fails.
+ */
+export const editRules = async (add: string[], remove: string[]): Promise<boolean> => {
+    const previousRules = state.userRules || '';
+    editRulesSeq += 1;
+    const seq = editRulesSeq;
+
+    setState('userRules', applyRulesEdit(previousRules, add, remove));
+    try {
+        const { rules } = await filteringEditRules({ add, remove });
+        if (seq === editRulesSeq) {
+            setState('userRules', rules.join('\n'));
+        }
+
+        return true;
+    } catch (error) {
+        if (seq === editRulesSeq) {
+            setState('userRules', previousRules);
+        }
+
+        addErrorToast({ error });
+        return false;
+    }
+};
+
+/**
+ * Adds rule to the custom filtering rules, removing the rules in replace, and
+ * shows a notification with an undo action that restores the previous rules.
+ */
+const addRuleWithUndo = async (rule: string, replace: string[], message: string): Promise<boolean> => {
+    const currentRules = splitByNewLine(state.userRules || '').map((r) => r.trim());
+    const hadRule = currentRules.includes(rule);
+    const toReplace = replace.filter((r) => r !== rule);
+    const replaced = toReplace.filter((r) => currentRules.includes(r));
+
+    if (hadRule && replaced.length === 0) {
         return true;
     }
 
-    const updatedRules = [...currentRules.filter((r: string) => r !== `@@${rule}`), rule];
-    const didSave = await setRules(`${updatedRules.join('\n')}\n`);
-
+    const didSave = await editRules([rule], toReplace);
     if (!didSave) {
         return false;
     }
 
     addSuccessToast(
-        createUndoToast(
-            intl.getMessage('user_rules_rule_added', { rule }),
-            intl.getMessage('notify_undo'),
-            async () => {
-                const didUndo = await setRules(previousRules);
-                if (didUndo) {
-                    await getFilteringStatus();
-                }
-            },
-        ),
+        createUndoToast(message, intl.getMessage('notify_undo'), async () => {
+            await editRules(replaced, hadRule ? [] : [rule]);
+        }),
     );
-    await getFilteringStatus();
+
     return true;
+};
+
+export const blockDomain = async (domain: string): Promise<boolean> => {
+    const rule = `||${domain}^$important`;
+
+    return addRuleWithUndo(rule, [`@@${rule}`], intl.getMessage('user_rules_rule_added', { rule }));
 };
 
 export const unblockDomain = async (domain: string): Promise<boolean> => {
-    const previousRules = state.userRules || '';
     const rule = `||${domain}^$important`;
     const desiredRule = `@@${rule}`;
-    const currentRules = splitByNewLine(previousRules);
 
-    if (currentRules.includes(desiredRule)) {
-        return true;
-    }
-
-    const updatedRules = [...currentRules.filter((r: string) => r !== rule), desiredRule];
-    const didSave = await setRules(`${updatedRules.join('\n')}\n`);
-
-    if (!didSave) {
-        return false;
-    }
-
-    addSuccessToast(
-        createUndoToast(
-            intl.getMessage('user_rules_rule_added', { rule: desiredRule }),
-            intl.getMessage('notify_undo'),
-            async () => {
-                const didUndo = await setRules(previousRules);
-                if (didUndo) {
-                    await getFilteringStatus();
-                }
-            },
-        ),
+    return addRuleWithUndo(
+        desiredRule,
+        [rule],
+        intl.getMessage('user_rules_rule_added', { rule: desiredRule }),
     );
-    await getFilteringStatus();
-    return true;
 };
 
 export const blockDomainForClient = async (domain: string, client: string): Promise<boolean> => {
-    const previousRules = state.userRules || '';
     const rule = `||${domain}^$client=${client}`;
-    const currentRules = splitByNewLine(previousRules);
 
-    if (currentRules.includes(rule)) {
-        return true;
-    }
-
-    const updatedRules = [...currentRules.filter((r: string) => r !== `@@${rule}`), rule];
-    const didSave = await setRules(`${updatedRules.join('\n')}\n`);
-
-    if (!didSave) {
-        return false;
-    }
-
-    addSuccessToast(
-        createUndoToast(
-            intl.getMessage('user_rules_rule_added_to_custom_filtering_rules'),
-            intl.getMessage('notify_undo'),
-            async () => {
-                const didUndo = await setRules(previousRules);
-                if (didUndo) {
-                    await getFilteringStatus();
-                }
-            },
-        ),
+    return addRuleWithUndo(
+        rule,
+        [`@@${rule}`],
+        intl.getMessage('user_rules_rule_added_to_custom_filtering_rules'),
     );
-    await getFilteringStatus();
-    return true;
 };
 
 export const BLOCK_ACTIONS = {
@@ -215,44 +228,17 @@ export const toggleBlocking = async (
 ): Promise<boolean> => {
     const baseBlockingRule = baseRule || `||${domain}^$important`;
     const baseUnblockingRule = baseUnblocking || `@@${baseBlockingRule}`;
-    const previousRules = state.userRules || '';
     const desiredRule = type === BLOCK_ACTIONS.BLOCK ? baseBlockingRule : baseUnblockingRule;
     const oppositeRule = type === BLOCK_ACTIONS.BLOCK ? baseUnblockingRule : baseBlockingRule;
-    const currentRules = splitByNewLine(previousRules);
-    const hasDesiredRule = currentRules.includes(desiredRule);
-    const rulesToReplace = [oppositeRule, matchedRuleToReplace].filter(
-        (rule): rule is string => Boolean(rule) && rule !== desiredRule,
+    const rulesToReplace = [oppositeRule, matchedRuleToReplace].filter((rule): rule is string =>
+        Boolean(rule),
     );
-    const hasRuleToReplace = rulesToReplace.some((rule) => currentRules.includes(rule));
 
-    if (hasDesiredRule && !hasRuleToReplace) {
-        return true;
-    }
-
-    const rulesToRemove = new Set([desiredRule, ...rulesToReplace]);
-    const updatedRules = currentRules.filter((rule: string) => !rulesToRemove.has(rule));
-    updatedRules.push(desiredRule);
-
-    const didSave = await setRules(`${updatedRules.join('\n')}\n`);
-
-    if (!didSave) {
-        return false;
-    }
-
-    addSuccessToast(
-        createUndoToast(
-            intl.getMessage('user_rules_rule_added', { rule: desiredRule }),
-            intl.getMessage('notify_undo'),
-            async () => {
-                const didUndo = await setRules(previousRules);
-                if (didUndo) {
-                    await getFilteringStatus();
-                }
-            },
-        ),
+    return addRuleWithUndo(
+        desiredRule,
+        rulesToReplace,
+        intl.getMessage('user_rules_rule_added', { rule: desiredRule }),
     );
-    await getFilteringStatus();
-    return true;
 };
 
 export const toggleBlockingForClient = (type: BlockAction, domain: string, client: string) => {

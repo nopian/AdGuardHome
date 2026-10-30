@@ -16,6 +16,7 @@ import (
 	"github.com/AdguardTeam/AdGuardHome/internal/aghtest"
 	"github.com/AdguardTeam/AdGuardHome/internal/schedule"
 	"github.com/AdguardTeam/golibs/testutil"
+	"github.com/miekg/dns"
 	"github.com/stretchr/testify/assert"
 	"github.com/stretchr/testify/require"
 )
@@ -494,6 +495,93 @@ func TestDNSFilter_HandleCheckHost(t *testing.T) {
 			require.NoError(t, err)
 
 			assert.Equal(t, tc.want, res)
+		})
+	}
+}
+
+func TestDNSFilter_handleFilteringEditRules(t *testing.T) {
+	setts := &Settings{
+		ProtectionEnabled: true,
+		FilteringEnabled:  true,
+	}
+
+	testCases := []struct {
+		name          string
+		body          string
+		wantRules     []string
+		wantFiltered  bool
+		wantCode      int
+		wantConfWrite bool
+	}{{
+		name:          "unblock",
+		body:          `{"add":["@@||ads.example.org^$important"],"remove":["||ads.example.org^"]}`,
+		wantRules:     []string{"! comment", "@@||ads.example.org^$important"},
+		wantFiltered:  false,
+		wantCode:      http.StatusOK,
+		wantConfWrite: true,
+	}, {
+		name:          "no_change",
+		body:          `{"add":["||ads.example.org^"],"remove":["||other.example.org^"]}`,
+		wantRules:     []string{"! comment", "||ads.example.org^"},
+		wantFiltered:  true,
+		wantCode:      http.StatusOK,
+		wantConfWrite: false,
+	}, {
+		name:          "empty_rule",
+		body:          `{"add":["  "]}`,
+		wantRules:     nil,
+		wantFiltered:  true,
+		wantCode:      http.StatusBadRequest,
+		wantConfWrite: false,
+	}, {
+		name:          "line_break",
+		body:          `{"add":["||a.example^\n||b.example^"]}`,
+		wantRules:     nil,
+		wantFiltered:  true,
+		wantCode:      http.StatusBadRequest,
+		wantConfWrite: false,
+	}}
+
+	for _, tc := range testCases {
+		t.Run(tc.name, func(t *testing.T) {
+			confWritten := false
+			confModifier := &aghtest.ConfigModifier{}
+			confModifier.OnApply = func(_ context.Context) {
+				confWritten = true
+			}
+
+			d, err := New(&Config{
+				Logger:           testLogger,
+				FilteringEnabled: true,
+				UserRules:        []string{"! comment", "||ads.example.org^"},
+				ConfModifier:     confModifier,
+				HTTPReg:          aghhttp.EmptyRegistrar{},
+				DataDir:          t.TempDir(),
+			}, nil)
+			require.NoError(t, err)
+			t.Cleanup(d.Close)
+
+			d.Start()
+			d.EnableFilters(false)
+
+			r := httptest.NewRequest(http.MethodPost, "/control/filtering/edit_rules", strings.NewReader(tc.body))
+			w := httptest.NewRecorder()
+			d.handleFilteringEditRules(w, r)
+
+			require.Equal(t, tc.wantCode, w.Code, w.Body.String())
+			assert.Equal(t, tc.wantConfWrite, confWritten)
+
+			if tc.wantCode == http.StatusOK {
+				resp := &filteringEditRulesResp{}
+				require.NoError(t, json.NewDecoder(w.Body).Decode(resp))
+				assert.Equal(t, tc.wantRules, resp.Rules)
+			}
+
+			// The change must take effect before the response is sent.
+			res, err := d.CheckHost("ads.example.org", dns.TypeA, setts)
+			require.NoError(t, err)
+
+			assert.Equal(t, tc.wantFiltered, res.IsFiltered)
 		})
 	}
 }
