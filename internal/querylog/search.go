@@ -7,6 +7,7 @@ import (
 	"io"
 	"log/slog"
 	"slices"
+	"strings"
 	"time"
 
 	"github.com/AdguardTeam/golibs/errors"
@@ -271,6 +272,11 @@ func (l *queryLog) searchFiles(
 	params *searchParams,
 	cache clientCache,
 ) (entries []*logEntry, oldest time.Time, total int) {
+	entries, oldest, total, ok := l.searchFilesIndexed(ctx, params, cache)
+	if ok {
+		return entries, oldest, total
+	}
+
 	r, err := l.setQLogReader(ctx, params.olderThan)
 	if err != nil {
 		l.logger.ErrorContext(ctx, "searching files", slogutil.KeyError, err)
@@ -293,6 +299,168 @@ func (l *queryLog) searchFiles(
 	}
 
 	return entries, oldest, total
+}
+
+// indexSearchBudget is the time after which a search using the index returns
+// the results found so far, if there are fewer than requested, so that the web
+// interface can show them and request more.
+const indexSearchBudget = 1 * time.Second
+
+// searchFilesIndexed is [queryLog.searchFiles] that uses the search index to
+// skip the blocks of records that can't match.  ok is false if the index can't
+// be used, in which case the files must be searched without it.  The search is
+// limited by [indexSearchBudget] instead of params.maxFileScanEntries, unless
+// the latter is zero.
+func (l *queryLog) searchFilesIndexed(
+	ctx context.Context,
+	params *searchParams,
+	cache clientCache,
+) (entries []*logEntry, oldest time.Time, total int, ok bool) {
+	s, err := l.index.newSearch(l.indexPaths(), params, func(clientID, ip string) (name string) {
+		if c, _ := l.client(clientID, ip, cache); c != nil {
+			return c.Name
+		}
+
+		return ""
+	})
+	if err != nil {
+		l.logger.ErrorContext(ctx, "searching with index", slogutil.KeyError, err)
+	}
+
+	if s == nil {
+		return nil, time.Time{}, 0, false
+	}
+
+	defer func() {
+		if closeErr := s.close(); closeErr != nil {
+			l.logger.ErrorContext(ctx, "closing files", slogutil.KeyError, closeErr)
+		}
+	}()
+
+	entries, oldestNano, total, err := l.readIndexedEntries(ctx, s, params, cache)
+	if err != nil {
+		l.logger.ErrorContext(ctx, "searching with index; rebuilding", slogutil.KeyError, err)
+		l.index.invalidate()
+		l.startIndexBuild(ctx)
+
+		return nil, time.Time{}, 0, false
+	}
+
+	if oldestNano != 0 {
+		oldest = time.Unix(0, oldestNano)
+	}
+
+	return entries, oldest, total, true
+}
+
+// indexedSearch is the state of a search using the index.
+type indexedSearch struct {
+	// entries are the matching entries found so far.
+	entries []*logEntry
+
+	// oldestNano is the time of the oldest record searched so far.
+	oldestNano int64
+
+	// total is the number of records processed so far.
+	total int
+}
+
+// readIndexedEntries reads the matching entries of the blocks of s, newest
+// first, up to params.offset + params.limit.  oldestNano is the time of the
+// oldest record searched, or zero if all records have been searched.
+func (l *queryLog) readIndexedEntries(
+	ctx context.Context,
+	s *indexSearch,
+	params *searchParams,
+	cache clientCache,
+) (entries []*logEntry, oldestNano int64, total int, err error) {
+	deadline := time.Now().Add(indexSearchBudget)
+	st := &indexedSearch{}
+	for fileIdx := currentFileIdx; fileIdx >= rotatedFileIdx; fileIdx-- {
+		blocks := s.blocks[fileIdx]
+		for i := len(blocks) - 1; i >= 0; i-- {
+			var done bool
+			done, err = l.searchBlock(ctx, s, fileIdx, blocks[i], params, cache, st)
+			if err != nil {
+				return nil, 0, 0, err
+			} else if done || (params.maxFileScanEntries > 0 && time.Now().After(deadline)) {
+				return st.entries, st.oldestNano, st.total, nil
+			}
+		}
+	}
+
+	return st.entries, 0, st.total, nil
+}
+
+// searchBlock adds the entries matching params from blk of the file with index
+// fileIdx to st.  done is true if the limit has been reached.
+func (l *queryLog) searchBlock(
+	ctx context.Context,
+	s *indexSearch,
+	fileIdx int,
+	blk *indexBlock,
+	params *searchParams,
+	cache clientCache,
+	st *indexedSearch,
+) (done bool, err error) {
+	if !blk.unknown && !params.olderThan.IsZero() && blk.minTime >= params.olderThan.UnixNano() {
+		// All records are newer than the requested ones.
+		return false, nil
+	}
+
+	if s.mayMatch(blk) {
+		var data []byte
+		data, err = s.readBlock(fileIdx, blk)
+		if err != nil {
+			return false, err
+		}
+
+		if l.matchBlock(ctx, data, params, cache, st) {
+			return true, nil
+		}
+	}
+
+	// The times of the rejected records aren't read, so continue after the
+	// whole block.
+	st.oldestNano = cmp.Or(blk.minTime, st.oldestNano)
+
+	return false, nil
+}
+
+// matchBlock adds the entries matching params from the records in data, newest
+// first, to st, up to params.offset + params.limit.  full is true if the limit
+// has been reached.
+func (l *queryLog) matchBlock(
+	ctx context.Context,
+	data []byte,
+	params *searchParams,
+	cache clientCache,
+	st *indexedSearch,
+) (full bool) {
+	totalLimit := params.offset + params.limit
+
+	// Convert the whole block at once instead of every line separately.
+	text := string(data)
+
+	// Skip the final newline.
+	end := len(text) - 1
+	for end > 0 {
+		lineStart := strings.LastIndexByte(text[:end], '\n') + 1
+		e, ts := l.matchLine(ctx, text[lineStart:end], params, cache, false)
+		st.oldestNano = cmp.Or(ts, st.oldestNano)
+		st.total++
+
+		if e != nil {
+			st.entries = append(st.entries, e)
+			if len(st.entries) == totalLimit {
+				return true
+			}
+		}
+
+		end = lineStart - 1
+	}
+
+	return false
 }
 
 // quickMatchClientFinder is a wrapper around the usual client finding function
@@ -340,15 +508,34 @@ func (l *queryLog) readNextEntry(
 		return nil, 0, err
 	}
 
+	e, ts = l.matchLine(ctx, line, params, cache, true)
+
+	return e, ts, nil
+}
+
+// matchLine decodes the log record in line and checks if it matches the search
+// criteria.  It optionally uses the client cache, if provided.  e is nil if
+// the record doesn't match.  ts is the timestamp of the record, or zero if it
+// can't be read or if needTS is false and the record is rejected without
+// decoding it.
+func (l *queryLog) matchLine(
+	ctx context.Context,
+	line string,
+	params *searchParams,
+	cache clientCache,
+	needTS bool,
+) (e *logEntry, ts int64) {
 	clientFinder := quickMatchClientFinder{
 		client: l.client,
 		cache:  cache,
 	}
 
 	if !params.quickMatch(ctx, l.logger, line, clientFinder.findClient) {
-		ts = readQLogTimestamp(ctx, l.logger, line)
+		if needTS {
+			ts = readQLogTimestamp(ctx, l.logger, line)
+		}
 
-		return nil, ts, nil
+		return nil, ts
 	}
 
 	e = &logEntry{}
@@ -358,9 +545,10 @@ func (l *queryLog) readNextEntry(
 	// continue after it.
 	ts = e.Time.UnixNano()
 	if l.isIgnored(e.QHost) {
-		return nil, ts, nil
+		return nil, ts
 	}
 
+	var err error
 	e.client, err = l.client(e.ClientID, e.IP.String(), cache)
 	if err != nil {
 		l.logger.ErrorContext(
@@ -376,12 +564,12 @@ func (l *queryLog) readNextEntry(
 	}
 
 	if e.client != nil && e.client.IgnoreQueryLog {
-		return nil, ts, nil
+		return nil, ts
 	}
 
 	if !params.match(e) {
-		return nil, ts, nil
+		return nil, ts
 	}
 
-	return e, ts, nil
+	return e, ts
 }

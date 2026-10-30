@@ -41,6 +41,9 @@ type queryLog struct {
 	// be modified.
 	buffer *container.RingBuffer[*logEntry]
 
+	// index is the search index of the log files.  It must not be nil.
+	index *searchIndex
+
 	// logFile is the path to the log file.
 	logFile string
 
@@ -49,6 +52,9 @@ type queryLog struct {
 
 	// fileFlushLock synchronizes a file-flushing goroutine and main thread.
 	fileFlushLock sync.Mutex
+
+	// fileWriteLock synchronizes writing to, rotating, and removing the log
+	// files.
 	fileWriteLock sync.Mutex
 
 	flushPending bool
@@ -94,7 +100,31 @@ func (l *queryLog) Start(ctx context.Context) (err error) {
 
 	go l.periodicRotate(ctx)
 
+	l.startIndexBuild(ctx)
+
 	return nil
+}
+
+// startIndexBuild starts building the search index in the background, unless
+// it's already being built.
+func (l *queryLog) startIndexBuild(ctx context.Context) {
+	if !l.index.building.CompareAndSwap(false, true) {
+		return
+	}
+
+	go func() {
+		defer l.index.building.Store(false)
+
+		l.index.build(ctx, l.logger, l.indexPaths(), &l.fileWriteLock)
+	}()
+}
+
+// indexPaths returns the paths of the rotated and the current log files.
+func (l *queryLog) indexPaths() (paths [2]string) {
+	return [2]string{
+		rotatedFileIdx: l.logFile + ".1",
+		currentFileIdx: l.logFile,
+	}
 }
 
 // Shutdown implements the [QueryLog] interface for *queryLog.
@@ -169,6 +199,11 @@ func (l *queryLog) clear(ctx context.Context) {
 		l.buffer.Clear()
 		l.flushPending = false
 	}()
+
+	l.fileWriteLock.Lock()
+	defer l.fileWriteLock.Unlock()
+
+	defer l.index.reset()
 
 	oldLogFile := l.logFile + ".1"
 	err := os.Remove(oldLogFile)

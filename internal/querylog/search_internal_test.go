@@ -270,17 +270,25 @@ func BenchmarkQueryLog_search(b *testing.B) {
 		},
 	}}
 
-	for _, bc := range benchCases {
-		b.Run(bc.name, func(b *testing.B) {
-			requests := 0
+	l.index.build(ctx, l.logger, l.indexPaths(), &l.fileWriteLock)
 
-			b.ReportAllocs()
-			for b.Loop() {
-				requests += searchLikeWebUI(ctx, l, bc.criterion, pageSize)
-			}
+	for _, indexed := range []bool{false, true} {
+		for _, bc := range benchCases {
+			b.Run(fmt.Sprintf("%s/indexed=%t", bc.name, indexed), func(b *testing.B) {
+				l.index.mu.Lock()
+				l.index.ready = indexed
+				l.index.mu.Unlock()
 
-			b.ReportMetric(float64(requests)/float64(b.N), "requests/op")
-		})
+				requests := 0
+
+				b.ReportAllocs()
+				for b.Loop() {
+					requests += searchLikeWebUI(ctx, l, bc.criterion, pageSize)
+				}
+
+				b.ReportMetric(float64(requests)/float64(b.N), "requests/op")
+			})
+		}
 	}
 }
 

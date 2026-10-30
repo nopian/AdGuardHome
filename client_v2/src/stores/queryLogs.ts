@@ -124,6 +124,7 @@ const shortPollQueryLogs = async (
     data: { logs: NormalizedQueryLogItem[]; oldest: string },
     filter: QueryLogFilter,
     total?: { logs: NormalizedQueryLogItem[]; oldest: string },
+    isStale: () => boolean = () => false,
 ): Promise<{ logs: NormalizedQueryLogItem[]; oldest: string }> => {
     const totalData = total
         ? { logs: [...total.logs, ...data.logs], oldest: data.oldest }
@@ -132,9 +133,9 @@ const shortPollQueryLogs = async (
         totalData.logs,
         filter?.status || DEFAULT_LOGS_FILTER.status,
     ).length;
-    if (visible >= QUERY_LOGS_PAGE_LIMIT || totalData.oldest === '') return totalData;
+    if (visible >= QUERY_LOGS_PAGE_LIMIT || totalData.oldest === '' || isStale()) return totalData;
     const more = await fetchLogsWithParams(totalData.oldest, filter);
-    return shortPollQueryLogs(more, filter, totalData);
+    return shortPollQueryLogs(more, filter, totalData, isStale);
 };
 
 // ---------- Public actions ----------
@@ -236,7 +237,15 @@ export const setLogsConfig = async (values: GetQueryLogConfigResponse): Promise<
     }
 };
 
+// filteredLogsSeq is the number of the latest search, so that the results of
+// the earlier ones, which may arrive later, are ignored.
+let filteredLogsSeq = 0;
+
 export const setFilteredLogs = async (filter?: QueryLogFilter): Promise<boolean> => {
+    filteredLogsSeq += 1;
+    const seq = filteredLogsSeq;
+    const isStale = () => seq !== filteredLogsSeq;
+
     setState({
         filter: filter ?? DEFAULT_LOGS_FILTER,
         isFiltered: true,
@@ -244,7 +253,11 @@ export const setFilteredLogs = async (filter?: QueryLogFilter): Promise<boolean>
     });
     try {
         const data = await fetchLogsWithParams('', filter);
-        const accumulated = await shortPollQueryLogs(data, filter);
+        const accumulated = await shortPollQueryLogs(data, filter, undefined, isStale);
+        if (isStale()) {
+            return true;
+        }
+
         setState({
             logs: accumulated.logs,
             oldest: accumulated.oldest,
@@ -254,6 +267,10 @@ export const setFilteredLogs = async (filter?: QueryLogFilter): Promise<boolean>
         });
         return true;
     } catch (error) {
+        if (isStale()) {
+            return true;
+        }
+
         addErrorToast({ error });
         setState('processingGetLogs', false);
         return false;

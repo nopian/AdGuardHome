@@ -116,6 +116,37 @@ describe('queryLogs store', () => {
         expect(queryLogsState.processingGetLogs).toBe(false);
     });
 
+    it('ignores the results of an earlier search that arrive later', async () => {
+        (queryLog as any).mockReset();
+
+        let respondFirst: (value: unknown) => void = () => {};
+        (queryLog as any).mockImplementationOnce(
+            () =>
+                new Promise((resolve) => {
+                    respondFirst = resolve;
+                }),
+        );
+        (queryLog as any).mockResolvedValueOnce({
+            data: [{ reason: 'FilteredBlackList', question: { name: 'second.example' } }],
+            oldest: '',
+        });
+
+        const first = setFilteredLogs({ search: 'fir', status: 'all', reason: 'all' });
+        const second = setFilteredLogs({ search: 'second', status: 'all', reason: 'all' });
+        await second;
+
+        respondFirst({
+            data: [{ reason: 'FilteredBlackList', question: { name: 'first.example' } }],
+            oldest: '',
+        });
+        await first;
+
+        expect(queryLogsState.filter.search).toBe('second');
+        expect(queryLogsState.logs).toHaveLength(1);
+        expect(queryLogsState.logs[0].domain).toBe('second.example');
+        expect(queryLogsState.processingGetLogs).toBe(false);
+    });
+
     it('always sends limit=20 to prevent loading all records at once', async () => {
         (queryLog as any).mockReset();
         (queryLog as any)

@@ -60,21 +60,6 @@ var filteringStatusValues = container.NewMapSet(
 	filteringStatusWhitelisted,
 )
 
-// reasonCodes is a set of all valid reason codes.
-var reasonCodes = [...]string{
-	filtering.NotFilteredAllowList:   "1",
-	filtering.NotFilteredError:       "2",
-	filtering.FilteredBlockList:      "3",
-	filtering.FilteredSafeBrowsing:   "4",
-	filtering.FilteredParental:       "5",
-	filtering.FilteredInvalid:        "6",
-	filtering.FilteredSafeSearch:     "7",
-	filtering.FilteredBlockedService: "8",
-	filtering.Rewritten:              "9",
-	filtering.RewrittenAutoHosts:     "10",
-	filtering.RewrittenRule:          "11",
-}
-
 // searchCriterion is a search criterion that is used to match a record.
 type searchCriterion struct {
 	// value is the target value for searching.  If
@@ -158,22 +143,13 @@ func (c *searchCriterion) quickMatch(
 
 		return ctDomainOrClientCaseNonStrict(c.value, c.asciiVal, clientID, name, host, ip)
 	case ctFilteringStatus:
-		// Go on, as we currently don't do quick matches against
-		// filtering statuses.
-		return true
+		reason, isFiltered, ok := quickResult(line)
+
+		return !ok || c.ctFilteringStatusCase(reason, isFiltered)
 	case ctReason:
-		reasonCode := readJSONNumericValue(line, `"Reason":`)
-		if reasonCode == "" {
-			// For [filtering.NotFilteredNotFound] reason can be empty.
-			return slices.Contains(c.values, filtering.NotFilteredNotFound.String())
-		}
+		reason, _, ok := quickResult(line)
 
-		idx := slices.Index(reasonCodes[:], reasonCode)
-		if idx == -1 {
-			return false
-		}
-
-		return slices.Contains(c.values, filtering.Reason(idx).String())
+		return !ok || slices.Contains(c.values, reason.String())
 	default:
 		return true
 	}

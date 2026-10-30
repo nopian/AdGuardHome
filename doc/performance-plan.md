@@ -126,12 +126,34 @@ Checks:
 - Blocked services: compile each set of blocked services once and cache it, instead of checking rules one by one on every query.
 - The Phase 0 checker must pass on both HaGeZi lists, the AdGuard default list and a hosts-format list before this ships.
 
-## Phase 3: new query log storage and instant search
+## Phase 3: instant query log search
 
-- Hourly segment files with fixed-width columns (time, domain ID, client ID, reason, query type, flags, latency) plus tables of the unique domains and clients in that hour.  DNS answers and rule text go in a separate area that is only read for rows actually displayed.  The in-memory part becomes the current, unfinished segment.
-- Search matches the text against each segment's unique domains, IPs, client IDs and client names first and skips segments with no match.  It then scans the narrow columns newest-first and stops at the page limit.  Status filters become a 1-byte comparison.
-- `GET /control/querylog` v2: results plus a cursor (segment and row) and a "complete" flag, with a server-side time budget.  An SSE stream for watching queries live.
-- Keep a read-only reader for old JSON logs until they age out, or convert them in the background.
+Instead of a new storage format, which would require migrating existing logs, the JSON log files stay as they are and get an in-memory search index (`internal/querylog/searchindex.go`):
+
+- The index splits each file into blocks of 256 records and keeps, for each block, its byte range, its time range, the set of filtering results in it, and the IDs of its domains and clients in shared dictionaries.  It takes about 7 bytes per record.
+- A search first matches the term against the dictionaries, which have thousands of entries instead of millions of records, including the client names, and then reads only the blocks that can contain a match.  The records in those blocks go through the same matching code as before, so the results are the same.
+- Status and reason filters read the result of a record without decoding it, both in the index and when matching records.
+- One request now searches the whole log, limited by a 1-second budget instead of 50,000 records, so the web interface no longer chains requests.
+- The index is built in the background at startup and updated when records are written, the log is rotated, or cleared.  Until it's ready, or if a file changes behind its back, searches work as before and the index is rebuilt.
+- The new web interface waits 150 ms instead of 500 ms after typing and ignores late results of earlier searches.
+
+Not done: a live stream of new queries, and saving the index to disk.  Building it takes about 1.5 s per million records.
+
+### Phase 3 results
+
+Same machine as the baseline, 1M records (244 MB of JSON).
+
+| Search, as the web interface does it | Before | After |
+|---|---|---|
+| Rare term, real server over HTTP | 0.81 s, 20 requests | 7 ms, 1 request |
+| No matches, real server over HTTP | 0.79 s, 21 requests | 3 ms, 1 request |
+| Rare reason (Safe Browsing), real server over HTTP | 0.58 s, 21 requests | 1 ms, 1 request |
+| Rare term, benchmark | 111 ms | 4.2 ms |
+| Term with matches 40k records apart, benchmark | 0.90 s, 16 requests | 5.1 ms, 1 request |
+| No matches, benchmark | 1.12 s, 21 requests | 1.0 ms |
+| Status filter without matches, benchmark | 6.1 s (1.38 s with the quick result check) | 0.04 ms |
+
+Checks: `TestSearchIndex_differential` compares searches with and without the index on random parameters (terms, strict terms, statuses, reasons, cursors, limits) over a log with both files, ignored domains and clients, and a record the index can't read; a one-off run of 3,000 searches found no difference.  `TestSearchIndex_lifecycle` covers writing, rotating twice, clearing, and a file changed behind the index's back.
 
 ## Phase 4: dashboard
 
